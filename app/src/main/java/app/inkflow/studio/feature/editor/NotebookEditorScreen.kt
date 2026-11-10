@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -282,6 +283,15 @@ fun NotebookEditorScreen(
     val recordingDurationMs by audioRecorder.durationMs.collectAsState()
     val isAudioPlaying by audioPlayer.isPlaying.collectAsState()
     val audioPlayPositionMs by audioPlayer.currentPositionMs.collectAsState()
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (audioRecorder.recordingState.value == RecordingState.RECORDING) {
+                audioRecorder.stopRecording()
+            }
+            audioPlayer.stop()
+        }
+    }
 
     // AI Workspace Side-panel State (100% Real Document Grounding)
     var showAiPanel by remember { mutableStateOf(false) }
@@ -2681,7 +2691,7 @@ fun NotebookEditorScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(8.dp)
                             ) {
-                                Icon(Icons.Default.NoteAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Icon(Icons.AutoMirrored.Filled.NoteAdd, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text("Add Note to Page ${currentPageIndex + 1}", fontSize = 12.sp)
                             }
