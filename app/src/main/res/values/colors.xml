@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand Palette: Deep Indigo & Slate with Muted Teal -->
+    <color name="ink_primary">#2563EB</color>
+    <color name="ink_primary_dark">#1D4ED8</color>
+    <color name="ink_accent">#0D9488</color>
+    <color name="ink_canvas_light">#F8FAFC</color>
+    <color name="ink_canvas_dark">#0F172A</color>
+    <color name="ink_surface_light">#FFFFFF</color>
+    <color name="ink_surface_dark">#1E293B</color>
+    <color name="ink_border_light">#E2E8F0</color>
+    <color name="ink_border_dark">#334155</color>
+    <color name="ink_text_primary_light">#0F172A</color>
+    <color name="ink_text_primary_dark">#F8FAFC</color>
+    <color name="ink_text_secondary_light">#64748B</color>
+    <color name="ink_text_secondary_dark">#94A3B8</color>
+    <color name="ink_rule_line">#CBD5E1</color>
+    <color name="ink_rule_line_dark">#334155</color>
+    <color name="ink_margin_line">#FCA5A5</color>
+</resources>
+

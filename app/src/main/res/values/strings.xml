@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">InkFlow Studio</string>
+    <string name="tagline">Premium Offline-First Handwriting &amp; Study Workspace</string>
+    
+    <!-- Navigation -->
+    <string name="nav_library">Library</string>
+    <string name="nav_recent">Recent</string>
+    <string name="nav_favorites">Favorites</string>
+    <string name="nav_whiteboard">Whiteboards</string>
+    <string name="nav_study">Study Sets</string>
+    <string name="nav_trash">Trash</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Actions -->
+    <string name="action_new_notebook">New Notebook</string>
+    <string name="action_new_whiteboard">New Whiteboard</string>
+    <string name="action_import_pdf">Import PDF</string>
+    <string name="action_new_folder">New Folder</string>
+    <string name="action_export">Export</string>
+    <string name="action_undo">Undo</string>
+    <string name="action_redo">Redo</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_restore">Restore</string>
+    <string name="action_clear">Clear</string>
+    <string name="action_save">Save</string>
+    <string name="action_search">Search library…</string>
+    
+    <!-- Tools -->
+    <string name="tool_pen">Fountain Pen</string>
+    <string name="tool_ballpoint">Ballpoint</string>
+    <string name="tool_pencil">Pencil</string>
+    <string name="tool_highlighter">Highlighter</string>
+    <string name="tool_eraser">Eraser</string>
+    <string name="tool_lasso">Lasso Select</string>
+    <string name="tool_shape">Shapes</string>
+    <string name="tool_text">Text</string>
+    <string name="tool_pan">Pan &amp; Zoom</string>
+
+    <!-- Templates -->
+    <string name="template_blank">Blank</string>
+    <string name="template_ruled">Ruled</string>
+    <string name="template_college_ruled">College Ruled</string>
+    <string name="template_dotted">Dotted</string>
+    <string name="template_grid">Grid</string>
+    <string name="template_cornell">Cornell</string>
+    <string name="template_checklist">Checklist</string>
+
+    <!-- Status -->
+    <string name="status_saved_offline">Saved on device</string>
+    <string name="status_recording">Recording…</string>
+    <string name="status_empty_library">No notes yet. Tap + to begin.</string>
+</resources>
+

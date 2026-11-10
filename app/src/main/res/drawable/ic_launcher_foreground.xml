@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Stylized Quill / Fountain Pen Nib with Ink Flow -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M54,24 L72,56 L62,60 L54,46 L46,60 L36,56 Z" />
+    <path
+        android:fillColor="#0D9488"
+        android:pathData="M51,46 L57,46 L55,76 L53,76 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,78 C52,78 50,80 50,82 C50,85 54,88 54,88 C54,88 58,85 58,82 C58,80 56,78 54,78 Z" />
+</vector>
+
