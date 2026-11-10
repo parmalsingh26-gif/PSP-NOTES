@@ -17,6 +17,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.StickyNote2
+import androidx.compose.material.icons.automirrored.filled.TrendingFlat
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -789,7 +791,7 @@ fun WhiteboardScreen(
                             Triple(WhiteboardTool.PEN, Icons.Default.Edit, "Freehand Pen"),
                             Triple(WhiteboardTool.HIGHLIGHTER, Icons.Default.BorderColor, "Highlighter"),
                             Triple(WhiteboardTool.ERASER, Icons.Default.AutoFixNormal, "Eraser"),
-                            Triple(WhiteboardTool.CONNECTOR_ARROW, Icons.Default.TrendingFlat, "Connector Arrow")
+                            Triple(WhiteboardTool.CONNECTOR_ARROW, Icons.AutoMirrored.Filled.TrendingFlat, "Connector Arrow")
                         ).forEach { (tool, icon, label) ->
                             val isSel = activeWbTool == tool
                             IconButton(
@@ -819,7 +821,7 @@ fun WhiteboardScreen(
                             shape = RoundedCornerShape(12.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
-                            Icon(Icons.Default.StickyNote2, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.AutoMirrored.Filled.StickyNote2, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Sticky", fontSize = 12.sp)
                         }

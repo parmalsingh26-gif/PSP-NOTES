@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.FormatAlignLeft
 import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.RotateRight
@@ -162,6 +163,12 @@ fun NotebookEditorScreen(
     var isDraggingRuler by remember { mutableStateOf(false) }
     var rulerDragStart by remember { mutableStateOf<Pair<Float, Float>?>(null) }
 
+    // PDF Reading Guide (Red Line Overlay)
+    var showReadingGuide by remember { mutableStateOf(false) }
+    var readingGuideY by remember { mutableFloatStateOf(300f) }
+    var isDraggingReadingGuide by remember { mutableStateOf(false) }
+    var readingGuideLastTapTime by remember { mutableLongStateOf(0L) }
+
     // Preset Shapes State
     var selectedPresetShape by remember { mutableStateOf(PresetShapeType.RECTANGLE) }
     var showPresetShapeMenu by remember { mutableStateOf(false) }
@@ -175,6 +182,8 @@ fun NotebookEditorScreen(
     var imageDragStartPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
     var initialImageSnapshot by remember { mutableStateOf<PageImageObject?>(null) }
     var showImageCropDialog by remember { mutableStateOf(false) }
+    var lastImageTapTime by remember { mutableLongStateOf(0L) }
+    var lastTappedImageId by remember { mutableStateOf<String?>(null) }
 
     // Text Manipulation State
     var selectedTextId by remember { mutableStateOf<String?>(null) }
@@ -197,6 +206,10 @@ fun NotebookEditorScreen(
     var showCustomColorDialog by remember { mutableStateOf(false) }
     var showInsertTextDialog by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
+    var showInsertPageDialog by remember { mutableStateOf(false) }
+    var insertPageTargetIndex by remember { mutableIntStateOf(0) }
+    var insertPageSelectedTemplate by remember { mutableStateOf(PageTemplate.RULED) }
+    var insertPagePositionMode by remember { mutableStateOf("AFTER") } // "AFTER", "BEFORE", "END"
     var pendingTextInsertDocCoords by remember { mutableStateOf(Pair(100f, 100f)) }
     var insertedTextContent by remember { mutableStateOf("") }
 
@@ -262,6 +275,7 @@ fun NotebookEditorScreen(
                     pageImages = updated
                     selectedImageId = newImg.id
                     selectedTextId = null
+                    selectTool(ToolType.PAN)
                     repository.savePageImages(targetPage.id, updated)
                     withContext(Dispatchers.Main) {
                         Toast.makeText(context, "Image inserted — drag handles to resize or rotate", Toast.LENGTH_SHORT).show()
@@ -336,17 +350,30 @@ fun NotebookEditorScreen(
         }
     }
 
+    // Track previous page id so we can save before switching
+    var previousPageId by remember { mutableStateOf<String?>(null) }
+
     // Load strokes, text notes, and images whenever currentPage changes
+    // PART 1 FIX: Save current page data BEFORE loading new page data to prevent image/text loss on navigation
     LaunchedEffect(currentPage?.id) {
-        currentPage?.id?.let { pageId ->
-            currentStrokes = repository.loadPageStrokes(pageId)
-            pageTexts = repository.loadPageTexts(pageId)
-            pageImages = repository.loadPageImages(pageId)
-            inkEngine.clearHistory()
-            selectedStrokes = emptySet()
-            selectedImageId = null
-            selectedTextId = null
+        val newPageId = currentPage?.id ?: return@LaunchedEffect
+        // Save previous page content before switching away (prevents data loss on page navigation)
+        previousPageId?.let { prevId ->
+            if (prevId != newPageId) {
+                repository.savePageStrokes(prevId, currentStrokes)
+                repository.savePageTexts(prevId, pageTexts)
+                repository.savePageImages(prevId, pageImages)
+            }
         }
+        previousPageId = newPageId
+        // Load new page content
+        currentStrokes = repository.loadPageStrokes(newPageId)
+        pageTexts = repository.loadPageTexts(newPageId)
+        pageImages = repository.loadPageImages(newPageId)
+        inkEngine.clearHistory()
+        selectedStrokes = emptySet()
+        selectedImageId = null
+        selectedTextId = null
     }
 
     // Decode bitmaps for any newly loaded images
@@ -532,13 +559,13 @@ fun NotebookEditorScreen(
 
                             IconButton(
                                 onClick = {
-                                    coroutineScope.launch {
-                                        repository.addPage(documentId, currentPage?.template ?: PageTemplate.RULED)
-                                        currentPageIndex = pages.size
-                                    }
+                                    insertPageTargetIndex = currentPageIndex
+                                    insertPagePositionMode = "AFTER"
+                                    insertPageSelectedTemplate = currentPage?.template ?: PageTemplate.RULED
+                                    showInsertPageDialog = true
                                 }
                             ) {
-                                Icon(Icons.Default.AddCircleOutline, contentDescription = "Add Page")
+                                Icon(Icons.Default.AddCircleOutline, contentDescription = "Insert Page Here")
                             }
                         }
 
@@ -554,6 +581,20 @@ fun NotebookEditorScreen(
                                     Icons.Default.Straighten,
                                     contentDescription = "Toggle Ruler",
                                     tint = if (showRuler) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            // PDF Reading Guide Toggle (Red Line Overlay for tracking reading position)
+                            IconButton(
+                                onClick = { showReadingGuide = !showReadingGuide },
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (showReadingGuide) Color(0x22DC2626) else Color.Transparent)
+                            ) {
+                                Icon(
+                                    Icons.Default.Menu,
+                                    contentDescription = "Toggle Reading Guide",
+                                    tint = if (showReadingGuide) Color(0xFFDC2626) else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
 
@@ -664,6 +705,24 @@ fun NotebookEditorScreen(
 
                             when (motionEvent.actionMasked) {
                                 MotionEvent.ACTION_DOWN -> {
+                                    // A0. Check if user tapped/dragged the Reading Guide line
+                                    if (showReadingGuide) {
+                                        val guideHitZone = 20f / totalScale
+                                        if (abs(rawDocY - readingGuideY) <= guideHitZone) {
+                                            val nowMs = System.currentTimeMillis()
+                                            val doubleTap = nowMs - readingGuideLastTapTime < 350L
+                                            readingGuideLastTapTime = nowMs
+                                            if (doubleTap) {
+                                                // Double-tap: hide the guide
+                                                showReadingGuide = false
+                                            } else {
+                                                // Single tap/drag: start dragging
+                                                isDraggingReadingGuide = true
+                                            }
+                                            return@pointerInteropFilter true
+                                        }
+                                    }
+
                                     // A. Check if user grabbed the Digital Ruler body to reposition it
                                     if (showRuler) {
                                         val rad = Math.toRadians(rulerAngleDeg.toDouble())
@@ -756,8 +815,18 @@ fun NotebookEditorScreen(
                                         }
                                     }
 
-                                    // E. Tap to select an Image or Text Object when in PAN, LASSO, or TEXT mode
-                                    if (effectiveTool == ToolType.PAN || effectiveTool == ToolType.LASSO || effectiveTool == ToolType.TEXT) {
+                                    // E. Tap to select an Image or Text Object (Single-tap in PAN/LASSO/TEXT, or Double-tap in ANY mode)
+                                    val tappedImg = pageImages.sortedBy { it.zIndex }.lastOrNull { img ->
+                                        rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
+                                    }
+                                    val now = System.currentTimeMillis()
+                                    val isImageDoubleTap = (tappedImg != null && tappedImg.id == lastTappedImageId && (now - lastImageTapTime) < 400L)
+                                    if (tappedImg != null) {
+                                        lastTappedImageId = tappedImg.id
+                                        lastImageTapTime = now
+                                    }
+
+                                    if (effectiveTool == ToolType.PAN || effectiveTool == ToolType.LASSO || effectiveTool == ToolType.TEXT || isImageDoubleTap) {
                                         val tappedText = pageTexts.lastOrNull { txt ->
                                             val lines = txt.text.split("\n")
                                             val boxW = ((lines.maxOfOrNull { it.length } ?: 4) * txt.fontSizeSp * 0.6f + 24f).coerceAtLeast(70f)
@@ -773,9 +842,6 @@ fun NotebookEditorScreen(
                                             return@pointerInteropFilter true
                                         }
 
-                                        val tappedImg = pageImages.sortedBy { it.zIndex }.lastOrNull { img ->
-                                            rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
-                                        }
                                         if (tappedImg != null) {
                                             selectedImageId = tappedImg.id
                                             selectedTextId = null
@@ -848,6 +914,12 @@ fun NotebookEditorScreen(
                                     if (isDraggingRuler && rulerDragStart != null) {
                                         rulerX = (rawDocX - rulerDragStart!!.first).coerceIn(40f, pageW - 40f)
                                         rulerY = (rawDocY - rulerDragStart!!.second).coerceIn(40f, pageH - 40f)
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    // Reading guide drag: move the line to finger position
+                                    if (isDraggingReadingGuide) {
+                                        readingGuideY = rawDocY.coerceIn(10f, pageH - 10f)
                                         return@pointerInteropFilter true
                                     }
 
@@ -962,6 +1034,11 @@ fun NotebookEditorScreen(
                                 }
 
                                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                    if (isDraggingReadingGuide) {
+                                        isDraggingReadingGuide = false
+                                        return@pointerInteropFilter true
+                                    }
+
                                     if (isDraggingRuler) {
                                         isDraggingRuler = false
                                         rulerDragStart = null
@@ -1362,6 +1439,47 @@ fun NotebookEditorScreen(
                                 anglePaint
                             )
                             drawContext.canvas.restore()
+                        }
+
+                        // 11. Draw PDF Reading Guide Overlay (Red Border with White Center, interactive toggle/drag)
+                        if (showReadingGuide) {
+                            val rY = readingGuideY.coerceIn(4f, pageH - 4f)
+                            val guideHeight = 8f / totalScale
+
+                            // Outer red border (top and bottom)
+                            drawRect(
+                                color = Color(0xFFDC2626).copy(alpha = 0.95f),
+                                topLeft = Offset(0f, rY - guideHeight / 2f),
+                                size = Size(pageW, guideHeight)
+                            )
+                            // White inner stripe
+                            drawRect(
+                                color = Color.White.copy(alpha = 0.90f),
+                                topLeft = Offset(0f, rY - guideHeight / 4f),
+                                size = Size(pageW, guideHeight / 2f)
+                            )
+
+                            // Reading Guide Handle indicator on the left & right margins
+                            drawCircle(
+                                color = Color(0xFFDC2626),
+                                radius = 7f / totalScale,
+                                center = Offset(14f / totalScale, rY)
+                            )
+                            drawCircle(
+                                color = Color.White,
+                                radius = 3.5f / totalScale,
+                                center = Offset(14f / totalScale, rY)
+                            )
+                            drawCircle(
+                                color = Color(0xFFDC2626),
+                                radius = 7f / totalScale,
+                                center = Offset(pageW - 14f / totalScale, rY)
+                            )
+                            drawCircle(
+                                color = Color.White,
+                                radius = 3.5f / totalScale,
+                                center = Offset(pageW - 14f / totalScale, rY)
+                            )
                         }
                     }
                 }
@@ -2012,12 +2130,12 @@ fun NotebookEditorScreen(
         // --- IMAGE CROP & ADJUSTMENTS DIALOG ---
         if (showImageCropDialog && selectedImage != null) {
             val img = selectedImage
-            var cLeft by remember(img.id) { mutableFloatStateOf(img.cropLeft) }
-            var cTop by remember(img.id) { mutableFloatStateOf(img.cropTop) }
-            var cRight by remember(img.id) { mutableFloatStateOf(img.cropRight) }
-            var cBottom by remember(img.id) { mutableFloatStateOf(img.cropBottom) }
-            var imgOpacity by remember(img.id) { mutableFloatStateOf(img.opacity) }
-            var lockAspect by remember(img.id) { mutableStateOf(img.aspectRatioLocked) }
+            var cLeft by remember(img) { mutableFloatStateOf(img.cropLeft) }
+            var cTop by remember(img) { mutableFloatStateOf(img.cropTop) }
+            var cRight by remember(img) { mutableFloatStateOf(img.cropRight) }
+            var cBottom by remember(img) { mutableFloatStateOf(img.cropBottom) }
+            var imgOpacity by remember(img) { mutableFloatStateOf(img.opacity) }
+            var lockAspect by remember(img) { mutableStateOf(img.aspectRatioLocked) }
 
             AlertDialog(
                 onDismissRequest = { showImageCropDialog = false },
@@ -2103,6 +2221,8 @@ fun NotebookEditorScreen(
                             } else it
                         }
                         pageImages = updated
+                        // PART 2 FIX: Restore selectedImageId so user can re-edit the image immediately after cropping
+                        selectedImageId = img.id
                         coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
                         showImageCropDialog = false
                     }) {
@@ -2238,16 +2358,15 @@ fun NotebookEditorScreen(
 
                             Button(
                                 onClick = {
-                                    coroutineScope.launch {
-                                        repository.addPage(documentId, currentPage?.template ?: PageTemplate.RULED)
-                                        currentPageIndex = pages.size
-                                        showPageManagerSheet = false
-                                    }
+                                    insertPageTargetIndex = currentPageIndex
+                                    insertPagePositionMode = "AFTER"
+                                    insertPageSelectedTemplate = PageTemplate.RULED
+                                    showInsertPageDialog = true
                                 }
                             ) {
                                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Add Page")
+                                Text("Insert Page")
                             }
                         }
                     }
@@ -2347,12 +2466,191 @@ fun NotebookEditorScreen(
                                             modifier = Modifier.size(16.dp)
                                         )
                                     }
+
+                                    // Quick Insert After Button on Page Thumbnail
+                                    IconButton(
+                                        onClick = {
+                                            insertPageTargetIndex = p.index
+                                            insertPagePositionMode = "AFTER"
+                                            insertPageSelectedTemplate = p.template
+                                            showInsertPageDialog = true
+                                        },
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.AddCircleOutline,
+                                            contentDescription = "Insert Page After",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // --- INSERT PAGE DIALOG (Mid-document Blank, Ruled, Dotted, Grid, Cornell, Checklist, Divider) ---
+        if (showInsertPageDialog) {
+            AlertDialog(
+                onDismissRequest = { showInsertPageDialog = false },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.PostAdd, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Insert Page in Document")
+                    }
+                },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Text("1. Insertion Position:", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { insertPagePositionMode = "AFTER" }
+                                    .background(if (insertPagePositionMode == "AFTER") MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else Color.Transparent)
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = insertPagePositionMode == "AFTER",
+                                    onClick = { insertPagePositionMode = "AFTER" }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "After Page ${insertPageTargetIndex + 1} (Insert into position ${insertPageTargetIndex + 2})",
+                                    fontSize = 13.sp,
+                                    fontWeight = if (insertPagePositionMode == "AFTER") FontWeight.SemiBold else FontWeight.Normal
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { insertPagePositionMode = "BEFORE" }
+                                    .background(if (insertPagePositionMode == "BEFORE") MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else Color.Transparent)
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = insertPagePositionMode == "BEFORE",
+                                    onClick = { insertPagePositionMode = "BEFORE" }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "Before Page ${insertPageTargetIndex + 1} (Insert into position ${insertPageTargetIndex + 1})",
+                                    fontSize = 13.sp,
+                                    fontWeight = if (insertPagePositionMode == "BEFORE") FontWeight.SemiBold else FontWeight.Normal
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable { insertPagePositionMode = "END" }
+                                    .background(if (insertPagePositionMode == "END") MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else Color.Transparent)
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = insertPagePositionMode == "END",
+                                    onClick = { insertPagePositionMode = "END" }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "At Document End (Page ${pages.size + 1})",
+                                    fontSize = 13.sp,
+                                    fontWeight = if (insertPagePositionMode == "END") FontWeight.SemiBold else FontWeight.Normal
+                                )
+                            }
+                        }
+
+                        HorizontalDivider()
+
+                        Text("2. Page Template & Style:", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            PageTemplate.entries.forEach { tmpl ->
+                                val isSelected = insertPageSelectedTemplate == tmpl
+                                val (label, desc, icon) = when (tmpl) {
+                                    PageTemplate.BLANK -> Triple("Blank White Page", "Plain clean sheet for drawing & diagrams", Icons.Default.CropPortrait)
+                                    PageTemplate.RULED -> Triple("Ruled Lined", "Standard wide lines with red left margin", Icons.AutoMirrored.Filled.FormatAlignLeft)
+                                    PageTemplate.COLLEGE_RULED -> Triple("College Ruled", "Narrow ruled lines for dense study notes", Icons.Default.DensitySmall)
+                                    PageTemplate.DOTTED -> Triple("Dotted Grid", "Bullet journal 5mm dot grid", Icons.Default.Grain)
+                                    PageTemplate.GRID -> Triple("Math / Graph Grid", "Cartesian graph grid for calculations", Icons.Default.Grid4x4)
+                                    PageTemplate.CORNELL -> Triple("Cornell Method", "Cue column & bottom summary block", Icons.Default.VerticalSplit)
+                                    PageTemplate.CHECKLIST -> Triple("Checklist / To-Do", "Ruled lines with interactive checkboxes", Icons.Default.Checklist)
+                                }
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { insertPageSelectedTemplate = tmpl },
+                                    color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                                    border = BorderStroke(if (isSelected) 2.dp else 1.dp, if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = null,
+                                            tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Column {
+                                            Text(label, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                            Text(desc, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            coroutineScope.launch {
+                                val afterIdx = when (insertPagePositionMode) {
+                                    "BEFORE" -> (insertPageTargetIndex - 1).coerceAtLeast(-1)
+                                    "END" -> (pages.size - 1).coerceAtLeast(-1)
+                                    else -> insertPageTargetIndex
+                                }
+                                val newPage = repository.insertPageAt(documentId, afterIdx, insertPageSelectedTemplate)
+                                val newIndex = (afterIdx + 1).coerceIn(0, pages.size)
+                                currentPageIndex = newIndex
+                                showInsertPageDialog = false
+                                showPageManagerSheet = false
+                                Toast.makeText(context, "Page inserted at position ${newIndex + 1}!", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Insert Page")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showInsertPageDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
         }
 
         // --- TOOL PROPERTIES & SAVED PEN PRESETS DIALOG ---

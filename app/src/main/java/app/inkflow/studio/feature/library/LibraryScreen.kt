@@ -14,6 +14,9 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Label
+import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.automirrored.outlined.NoteAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -423,7 +426,7 @@ fun LibraryScreen(
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Icon(
-                                imageVector = if (selectedFilter == LibraryFilter.TRASH) Icons.Outlined.DeleteSweep else Icons.Outlined.NoteAdd,
+                                imageVector = if (selectedFilter == LibraryFilter.TRASH) Icons.Outlined.DeleteSweep else Icons.AutoMirrored.Outlined.NoteAdd,
                                 contentDescription = null,
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                                 modifier = Modifier.size(64.dp)
@@ -903,7 +906,7 @@ fun DocumentCard(
             ) {
                 // Type Icon Badge
                 val (badgeColor, typeIcon, typeLabel) = when (document.type) {
-                    DocumentType.NOTEBOOK -> Triple(Color(0xFF2563EB), Icons.Default.MenuBook, "Notebook")
+                    DocumentType.NOTEBOOK -> Triple(Color(0xFF2563EB), Icons.AutoMirrored.Filled.MenuBook, "Notebook")
                     DocumentType.PDF -> Triple(Color(0xFFDC2626), Icons.Default.PictureAsPdf, "PDF")
                     DocumentType.WHITEBOARD -> Triple(Color(0xFF0D9488), Icons.Default.Dashboard, "Board")
                     else -> Triple(Color(0xFF6B7280), Icons.Default.Description, "Document")
@@ -1018,7 +1021,7 @@ fun DocumentCard(
                                 )
                                 DropdownMenuItem(
                                     text = { Text("Edit Tags") },
-                                    leadingIcon = { Icon(Icons.Default.Label, contentDescription = null) },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Label, contentDescription = null) },
                                     onClick = {
                                         menuExpanded = false
                                         onEditTags()

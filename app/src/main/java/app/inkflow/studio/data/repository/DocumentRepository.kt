@@ -296,6 +296,38 @@ class DocumentRepository(
         newPage
     }
 
+    /**
+     * Inserts a new page with the specified template immediately after [afterIndex] (0-based).
+     * Shifts subsequent page indices by +1 to maintain continuous sequential ordering.
+     */
+    suspend fun insertPageAt(
+        documentId: String,
+        afterIndex: Int,
+        template: PageTemplate = PageTemplate.RULED
+    ): Page = withContext(Dispatchers.IO) {
+        val allPages = pageDao.getPagesForDocumentSync(documentId)
+        val targetInsertIndex = (afterIndex + 1).coerceIn(0, allPages.size)
+
+        // Shift all pages that come at or after the target insertion index
+        for (page in allPages.filter { it.pageIndex >= targetInsertIndex }) {
+            pageDao.insertOrUpdate(page.copy(pageIndex = page.pageIndex + 1))
+        }
+
+        val newPage = Page(
+            id = UUID.randomUUID().toString(),
+            documentId = documentId,
+            index = targetInsertIndex,
+            template = template
+        )
+        pageDao.insertOrUpdate(PageEntity.fromDomain(newPage))
+
+        // Update document page count
+        documentDao.getDocumentById(documentId)?.let { doc ->
+            documentDao.update(doc.copy(pageCount = allPages.size + 1, updatedAt = System.currentTimeMillis()))
+        }
+        newPage
+    }
+
     suspend fun setPageBookmark(pageId: String, isBookmarked: Boolean) = withContext(Dispatchers.IO) {
         pageDao.setBookmark(pageId, isBookmarked)
     }

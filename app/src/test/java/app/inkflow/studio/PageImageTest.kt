@@ -76,5 +76,49 @@ class PageImageTest {
         assertEquals(70f, duplicate.y, 0.01f)
         assertEquals(original.width, duplicate.width, 0.01f)
     }
+
+    @Test
+    fun testPageImageCropParametersAndAspectRatio() {
+        val original = PageImageObject(
+            id = "img-crop-1",
+            pageId = "p1",
+            filePath = "/path/test.png",
+            x = 50f,
+            y = 50f,
+            width = 200f,
+            height = 150f,
+            cropLeft = 0.1f,
+            cropTop = 0.15f,
+            cropRight = 0.9f,
+            cropBottom = 0.85f,
+            aspectRatioLocked = true
+        )
+
+        val json = gson.toJson(listOf(original))
+        val type = object : TypeToken<List<PageImageObject>>() {}.type
+        val loaded = gson.fromJson<List<PageImageObject>>(json, type)[0]
+
+        assertEquals(0.1f, loaded.cropLeft, 0.001f)
+        assertEquals(0.15f, loaded.cropTop, 0.001f)
+        assertEquals(0.9f, loaded.cropRight, 0.001f)
+        assertEquals(0.85f, loaded.cropBottom, 0.001f)
+        assertTrue(loaded.aspectRatioLocked)
+    }
+
+    @Test
+    fun testPageImagePageIdSeparation() {
+        // Verify images on different pages maintain separate pageIds
+        val imgPage1 = PageImageObject(id = "i1", pageId = "page-1", filePath = "/p1.png", x = 10f, y = 10f)
+        val imgPage2 = PageImageObject(id = "i2", pageId = "page-2", filePath = "/p2.png", x = 20f, y = 20f)
+
+        val allImages = listOf(imgPage1, imgPage2)
+        val p1Images = allImages.filter { it.pageId == "page-1" }
+        val p2Images = allImages.filter { it.pageId == "page-2" }
+
+        assertEquals(1, p1Images.size)
+        assertEquals("i1", p1Images[0].id)
+        assertEquals(1, p2Images.size)
+        assertEquals("i2", p2Images[0].id)
+    }
 }
 
