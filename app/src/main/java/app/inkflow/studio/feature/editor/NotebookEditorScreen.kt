@@ -403,10 +403,30 @@ fun NotebookEditorScreen(
         }
     }
 
-    // Render PDF page bitmap whenever currentPageIndex or pdfRenderer changes
-    LaunchedEffect(currentPageIndex, pdfRenderer) {
+    // View Mode: Continuous Vertical Scrolling (like standard PDF / Acrobat) vs Single Page Flip
+    var isContinuousVerticalScroll by remember { mutableStateOf(document?.type == DocumentType.PDF) }
+    val pdfBitmaps = remember { mutableStateMapOf<Int, Bitmap>() }
+
+    // Render PDF page bitmap whenever currentPageIndex, pdfRenderer, or isContinuousVerticalScroll changes
+    LaunchedEffect(currentPageIndex, pdfRenderer, isContinuousVerticalScroll) {
         pdfRenderer?.let { renderer ->
-            pdfBitmap = renderer.renderPage(currentPageIndex)
+            val pCount = renderer.pageCount
+            val pagesToLoad = if (isContinuousVerticalScroll && pCount > 1) {
+                ((currentPageIndex - 1).coerceAtLeast(0)..(currentPageIndex + 2).coerceAtMost(pCount - 1)).toList()
+            } else {
+                listOf(currentPageIndex)
+            }
+            for (idx in pagesToLoad) {
+                if (!pdfBitmaps.containsKey(idx)) {
+                    val bmp = renderer.renderPage(idx)
+                    if (bmp != null) {
+                        pdfBitmaps[idx] = bmp
+                        if (idx == currentPageIndex) pdfBitmap = bmp
+                    }
+                } else if (idx == currentPageIndex) {
+                    pdfBitmap = pdfBitmaps[idx]
+                }
+            }
         }
     }
 
@@ -565,6 +585,27 @@ fun NotebookEditorScreen(
                                 }
                             ) {
                                 Icon(Icons.Default.ChevronRight, contentDescription = "Next Page")
+                            }
+
+                            // Scroll Mode Toggle: Single Page Flip vs Continuous Vertical Scroll
+                            IconButton(
+                                onClick = {
+                                    isContinuousVerticalScroll = !isContinuousVerticalScroll
+                                    Toast.makeText(
+                                        context,
+                                        if (isContinuousVerticalScroll) "Vertical Scrolling View (Standard PDF)" else "Single Page View",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                },
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (isContinuousVerticalScroll) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                            ) {
+                                Icon(
+                                    imageVector = if (isContinuousVerticalScroll) Icons.Default.ViewStream else Icons.Default.CropPortrait,
+                                    contentDescription = "Toggle Scroll Mode",
+                                    tint = if (isContinuousVerticalScroll) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
 
                             IconButton(
