@@ -1,6 +1,7 @@
 package app.inkflow.studio.feature.library
 
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
@@ -20,16 +21,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.inkflow.studio.InkFlowApplication
 import app.inkflow.studio.core.design.*
 import app.inkflow.studio.data.repository.DocumentRepository
 import app.inkflow.studio.domain.model.Document
 import app.inkflow.studio.domain.model.DocumentType
 import app.inkflow.studio.domain.model.PageTemplate
 import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -66,10 +71,39 @@ fun LibraryScreen(
             coroutineScope.launch {
                 val doc = repository.createPdfDocument(
                     title = "Imported Document",
-                    uri = it,
-                    pageCount = 1
+                    uri = it
                 )
                 onOpenDocument(doc)
+            }
+        }
+    }
+
+    val context = LocalContext.current
+    val app = context.applicationContext as? InkFlowApplication
+    val backupManager = app?.backupManager
+    var showSettingsDialog by remember { mutableStateOf(false) }
+
+    val restoreBackupPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            coroutineScope.launch {
+                try {
+                    val tempBackup = File(context.cacheDir, "temp_restore.json")
+                    context.contentResolver.openInputStream(it)?.use { input ->
+                        FileOutputStream(tempBackup).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    val restored = backupManager?.restoreBackup(tempBackup) ?: false
+                    if (restored) {
+                        Toast.makeText(context, "Backup restored successfully!", Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(context, "Failed to restore backup", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }
@@ -143,6 +177,12 @@ fun LibraryScreen(
                 onClick = { selectedFilter = LibraryFilter.TRASH },
                 icon = { Icon(Icons.Outlined.Delete, contentDescription = "Trash") },
                 label = { Text("Trash", fontSize = 11.sp) }
+            )
+            NavigationRailItem(
+                selected = showSettingsDialog,
+                onClick = { showSettingsDialog = true },
+                icon = { Icon(Icons.Outlined.Settings, contentDescription = "Settings") },
+                label = { Text("Settings", fontSize = 11.sp) }
             )
         }
 
@@ -456,6 +496,78 @@ fun LibraryScreen(
             dismissButton = {
                 TextButton(onClick = { showRenameDialog = null }) {
                     Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Settings & Backup Dialog
+    if (showSettingsDialog) {
+        AlertDialog(
+            onDismissRequest = { showSettingsDialog = false },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Settings, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("InkFlow Settings & Backup")
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Text(
+                        text = "InkFlow Studio v1.0.0 (Native Offline)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Your data is stored 100% locally on this device in SQLite and sandboxed vector storage.",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    HorizontalDivider()
+
+                    Text("Full Data Portability & Safety:", fontWeight = FontWeight.SemiBold)
+
+                    // Export Full Backup Button
+                    Button(
+                        onClick = {
+                            coroutineScope.launch {
+                                try {
+                                    val backupFile = backupManager?.createBackup()
+                                    if (backupFile != null && backupFile.exists()) {
+                                        Toast.makeText(context, "Backup created: ${backupFile.name} (${backupFile.length() / 1024} KB)", Toast.LENGTH_LONG).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Backup failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Backup, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Export Full Library Backup (JSON)")
+                    }
+
+                    // Restore Backup Button
+                    OutlinedButton(
+                        onClick = {
+                            restoreBackupPickerLauncher.launch(arrayOf("application/json", "*/*"))
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Restore, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Restore Library from Backup")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = { showSettingsDialog = false }) {
+                    Text("Close")
                 }
             }
         )

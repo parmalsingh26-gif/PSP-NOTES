@@ -1,6 +1,8 @@
 package app.inkflow.studio.data.repository
 
+import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import app.inkflow.studio.data.local.AppDatabase
 import app.inkflow.studio.data.local.PdfFileStore
 import app.inkflow.studio.data.local.StrokeFileStore
@@ -12,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.UUID
 
 class DocumentRepository(
@@ -80,12 +83,62 @@ class DocumentRepository(
     suspend fun createPdfDocument(
         title: String,
         uri: Uri,
-        pageCount: Int,
         folderId: String? = null
     ): Document = withContext(Dispatchers.IO) {
         val docId = UUID.randomUUID().toString()
         val savedPath = pdfFileStore.copyPdfFromUri(docId, uri)
+        val file = File(savedPath)
         val now = System.currentTimeMillis()
+
+        var actualPageCount = 1
+        val pages = mutableListOf<PageEntity>()
+
+        try {
+            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            if (pfd != null) {
+                val renderer = PdfRenderer(pfd)
+                actualPageCount = renderer.pageCount.coerceAtLeast(1)
+
+                for (idx in 0 until actualPageCount) {
+                    val pdfPage = renderer.openPage(idx)
+                    val w = pdfPage.width.toFloat()
+                    val h = pdfPage.height.toFloat()
+                    pdfPage.close()
+
+                    pages.add(
+                        PageEntity(
+                            id = UUID.randomUUID().toString(),
+                            documentId = docId,
+                            pageIndex = idx,
+                            width = if (w > 0f) w else 595f,
+                            height = if (h > 0f) h else 842f,
+                            template = PageTemplate.BLANK.name,
+                            isBookmarked = false
+                        )
+                    )
+                }
+                renderer.close()
+                pfd.close()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // Fallback for empty list
+        if (pages.isEmpty()) {
+            pages.add(
+                PageEntity(
+                    id = UUID.randomUUID().toString(),
+                    documentId = docId,
+                    pageIndex = 0,
+                    width = 595f,
+                    height = 842f,
+                    template = PageTemplate.BLANK.name,
+                    isBookmarked = false
+                )
+            )
+        }
+
         val doc = Document(
             id = docId,
             title = title.ifBlank { "Imported PDF" },
@@ -93,23 +146,10 @@ class DocumentRepository(
             folderId = folderId,
             createdAt = now,
             updatedAt = now,
-            pageCount = pageCount.coerceAtLeast(1),
+            pageCount = actualPageCount,
             pdfFilePath = savedPath
         )
         documentDao.insertOrUpdate(DocumentEntity.fromDomain(doc))
-
-        // Create page entries for all PDF pages
-        val pages = (0 until doc.pageCount).map { idx ->
-            PageEntity(
-                id = UUID.randomUUID().toString(),
-                documentId = docId,
-                pageIndex = idx,
-                width = 595f,
-                height = 842f,
-                template = PageTemplate.BLANK.name,
-                isBookmarked = false
-            )
-        }
         pageDao.insertAll(pages)
         doc
     }
@@ -210,6 +250,52 @@ class DocumentRepository(
         pageDao.updateTemplate(pageId, template.name)
     }
 
+    suspend fun deletePage(pageId: String, documentId: String): Boolean = withContext(Dispatchers.IO) {
+        val pages = pageDao.getPagesForDocumentSync(documentId)
+        if (pages.size <= 1) {
+            return@withContext false
+        }
+        pageDao.deletePage(pageId)
+        strokeFileStore.deletePageStrokes(pageId)
+
+        val remaining = pageDao.getPagesForDocumentSync(documentId)
+        for ((idx, p) in remaining.withIndex()) {
+            pageDao.insertOrUpdate(p.copy(pageIndex = idx))
+        }
+
+        documentDao.getDocumentById(documentId)?.let { doc ->
+            documentDao.update(doc.copy(pageCount = remaining.size, updatedAt = System.currentTimeMillis()))
+        }
+        true
+    }
+
+    suspend fun duplicatePage(pageId: String, documentId: String): Page? = withContext(Dispatchers.IO) {
+        val originalEntity = pageDao.getPageById(pageId) ?: return@withContext null
+        val originalStrokes = strokeFileStore.loadPageStrokes(pageId)
+
+        val newPageId = UUID.randomUUID().toString()
+        val currentCount = pageDao.getPageCount(documentId)
+        val duplicatedPage = PageEntity(
+            id = newPageId,
+            documentId = documentId,
+            pageIndex = currentCount,
+            width = originalEntity.width,
+            height = originalEntity.height,
+            template = originalEntity.template,
+            isBookmarked = false
+        )
+        pageDao.insertOrUpdate(duplicatedPage)
+
+        val duplicatedStrokes = originalStrokes.map { it.copy(id = UUID.randomUUID().toString()) }
+        strokeFileStore.savePageStrokes(newPageId, duplicatedStrokes)
+
+        documentDao.getDocumentById(documentId)?.let { doc ->
+            documentDao.update(doc.copy(pageCount = currentCount + 1, updatedAt = System.currentTimeMillis()))
+        }
+
+        duplicatedPage.toDomain().copy(strokes = duplicatedStrokes)
+    }
+
     // --- Vector Strokes and Objects ---
     suspend fun savePageStrokes(pageId: String, strokes: List<InkStroke>) = withContext(Dispatchers.IO) {
         strokeFileStore.savePageStrokes(pageId, strokes)
@@ -217,6 +303,14 @@ class DocumentRepository(
 
     suspend fun loadPageStrokes(pageId: String): List<InkStroke> = withContext(Dispatchers.IO) {
         strokeFileStore.loadPageStrokes(pageId)
+    }
+
+    suspend fun savePageTexts(pageId: String, texts: List<PageTextObject>) = withContext(Dispatchers.IO) {
+        strokeFileStore.savePageTexts(pageId, texts)
+    }
+
+    suspend fun loadPageTexts(pageId: String): List<PageTextObject> = withContext(Dispatchers.IO) {
+        strokeFileStore.loadPageTexts(pageId)
     }
 
     suspend fun saveWhiteboardObjects(documentId: String, objects: List<CanvasObject>) = withContext(Dispatchers.IO) {

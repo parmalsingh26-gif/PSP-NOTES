@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
             val uri = intent.data
             if (uri != null && (intent.type == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true))) {
                 lifecycleScope.launch {
-                    val doc = repository.createPdfDocument("Imported Document", uri, 1)
+                    val doc = repository.createPdfDocument("Imported Document", uri)
                     // Handled gracefully in library list
                 }
             }

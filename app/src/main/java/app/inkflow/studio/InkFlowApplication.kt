@@ -1,6 +1,7 @@
 package app.inkflow.studio
 
 import android.app.Application
+import app.inkflow.studio.data.backup.BackupManager
 import app.inkflow.studio.data.local.AppDatabase
 import app.inkflow.studio.data.local.PdfFileStore
 import app.inkflow.studio.data.local.StrokeFileStore
@@ -18,6 +19,8 @@ class InkFlowApplication : Application() {
         private set
     lateinit var studyRepository: StudyRepository
         private set
+    lateinit var backupManager: BackupManager
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -26,6 +29,6 @@ class InkFlowApplication : Application() {
         pdfFileStore = PdfFileStore(this)
         documentRepository = DocumentRepository(database, strokeFileStore, pdfFileStore)
         studyRepository = StudyRepository(database)
+        backupManager = BackupManager(this, database, strokeFileStore)
     }
 }
-

@@ -3,6 +3,7 @@ package app.inkflow.studio.data.local
 import android.content.Context
 import app.inkflow.studio.domain.model.CanvasObject
 import app.inkflow.studio.domain.model.InkStroke
+import app.inkflow.studio.domain.model.PageTextObject
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +15,7 @@ import java.io.OutputStreamWriter
 class StrokeFileStore(private val context: Context) {
     private val gson = Gson()
     private val strokesDir = File(context.filesDir, "strokes").apply { mkdirs() }
+    private val textsDir = File(context.filesDir, "texts").apply { mkdirs() }
     private val whiteboardDir = File(context.filesDir, "whiteboards").apply { mkdirs() }
 
     suspend fun savePageStrokes(pageId: String, strokes: List<InkStroke>) = withContext(Dispatchers.IO) {
@@ -51,11 +53,49 @@ class StrokeFileStore(private val context: Context) {
         }
     }
 
+    suspend fun savePageTexts(pageId: String, texts: List<PageTextObject>) = withContext(Dispatchers.IO) {
+        val targetFile = File(textsDir, "$pageId.json")
+        val tempFile = File(textsDir, "$pageId.tmp")
+        try {
+            FileOutputStream(tempFile).use { fos ->
+                OutputStreamWriter(fos, Charsets.UTF_8).use { writer ->
+                    gson.toJson(texts, writer)
+                    writer.flush()
+                }
+                fos.fd.sync()
+            }
+            if (targetFile.exists()) targetFile.delete()
+            tempFile.renameTo(targetFile)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            if (tempFile.exists()) tempFile.delete()
+        }
+    }
+
+    suspend fun loadPageTexts(pageId: String): List<PageTextObject> = withContext(Dispatchers.IO) {
+        val targetFile = File(textsDir, "$pageId.json")
+        if (!targetFile.exists()) return@withContext emptyList()
+        try {
+            targetFile.bufferedReader(Charsets.UTF_8).use { reader ->
+                val type = object : TypeToken<List<PageTextObject>>() {}.type
+                gson.fromJson<List<PageTextObject>>(reader, type) ?: emptyList()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            emptyList()
+        }
+    }
+
     suspend fun deletePageStrokes(pageId: String) = withContext(Dispatchers.IO) {
         val targetFile = File(strokesDir, "$pageId.json")
         if (targetFile.exists()) targetFile.delete()
         val tempFile = File(strokesDir, "$pageId.tmp")
         if (tempFile.exists()) tempFile.delete()
+
+        val textTarget = File(textsDir, "$pageId.json")
+        if (textTarget.exists()) textTarget.delete()
+        val textTemp = File(textsDir, "$pageId.tmp")
+        if (textTemp.exists()) textTemp.delete()
     }
 
     suspend fun saveWhiteboardObjects(documentId: String, objects: List<CanvasObject>) = withContext(Dispatchers.IO) {
@@ -91,4 +131,3 @@ class StrokeFileStore(private val context: Context) {
         }
     }
 }
-
