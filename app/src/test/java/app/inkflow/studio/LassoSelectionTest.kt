@@ -53,3 +53,4 @@ class LassoSelectionTest {
         assertEquals("outside-1", remaining[0].id)
     }
 }
+

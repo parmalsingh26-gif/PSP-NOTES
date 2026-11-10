@@ -1,11 +1,13 @@
 package app.inkflow.studio.feature.editor
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.view.MotionEvent
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
-import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -14,9 +16,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
-import androidx.compose.material.icons.automirrored.outlined.NoteAdd
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -30,11 +32,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.inkflow.studio.core.design.*
@@ -46,7 +46,9 @@ import app.inkflow.studio.feature.audio.AudioNotePlayer
 import app.inkflow.studio.feature.audio.AudioNoteRecorder
 import app.inkflow.studio.feature.audio.RecordingState
 import app.inkflow.studio.feature.ink.InkEngine
+import app.inkflow.studio.feature.ink.PresetShapeType
 import app.inkflow.studio.feature.ink.RecognizedShapeType
+import app.inkflow.studio.feature.ink.ShapeFactory
 import app.inkflow.studio.feature.ink.ShapeRecognizer
 import app.inkflow.studio.feature.ink.TemplateRenderer
 import app.inkflow.studio.feature.pdf.PdfExporter
@@ -57,6 +59,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.hypot
 import kotlin.math.min
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -81,15 +84,38 @@ fun NotebookEditorScreen(
     val inkEngine = remember { InkEngine() }
     var currentStrokes by remember { mutableStateOf<List<InkStroke>>(emptyList()) }
     var pageTexts by remember { mutableStateOf<List<PageTextObject>>(emptyList()) }
+    var pageImages by remember { mutableStateOf<List<PageImageObject>>(emptyList()) }
     var activeStrokeState by remember { mutableStateOf<InkStroke?>(null) }
+
+    // Decoded Bitmap Cache for Page Images
+    val imageBitmaps = remember { mutableStateMapOf<String, Bitmap>() }
 
     // Canvas Transform (Pan & Zoom)
     var zoomScale by remember { mutableFloatStateOf(1.0f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
 
+    // Multi-touch Pinch & Pan tracking
+    var isPinching by remember { mutableStateOf(false) }
+    var lastPinchDist by remember { mutableFloatStateOf(0f) }
+    var lastPinchMid by remember { mutableStateOf(Offset.Zero) }
+
     // Settings & Toggles
     var isStylusOnlyMode by remember { mutableStateOf(false) }
     var isShapeSnapEnabled by remember { mutableStateOf(false) }
+
+    // Preset Shapes State
+    var selectedPresetShape by remember { mutableStateOf(PresetShapeType.RECTANGLE) }
+    var showPresetShapeMenu by remember { mutableStateOf(false) }
+    var shapeStartPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    var shapeCurrentPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+
+    // Image Manipulation State
+    var selectedImageId by remember { mutableStateOf<String?>(null) }
+    val selectedImage = pageImages.find { it.id == selectedImageId }
+    var isDraggingImage by remember { mutableStateOf(false) }
+    var isResizingImage by remember { mutableStateOf(false) }
+    var imageDragStartPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+    var initialImageBounds by remember { mutableStateOf<Triple<Float, Float, Pair<Float, Float>>?>(null) } // x, y, (w, h)
 
     // Lasso Selection State
     var lassoPoints by remember { mutableStateOf<List<Pair<Float, Float>>>(emptyList()) }
@@ -103,6 +129,41 @@ fun NotebookEditorScreen(
     var showInsertTextDialog by remember { mutableStateOf(false) }
     var pendingTextInsertDocCoords by remember { mutableStateOf(Pair(100f, 100f)) }
     var insertedTextContent by remember { mutableStateOf("") }
+
+    // Image Picker Launcher
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            coroutineScope.launch {
+                try {
+                    val savedPath = repository.copyImageFromUri(it)
+                    val targetPage = currentPage ?: return@launch
+                    val newImg = PageImageObject(
+                        id = UUID.randomUUID().toString(),
+                        pageId = targetPage.id,
+                        filePath = savedPath,
+                        x = ((targetPage.width - 240f) / 2f).coerceAtLeast(20f),
+                        y = ((targetPage.height - 240f) / 2f).coerceAtLeast(20f),
+                        width = 240f,
+                        height = 240f
+                    )
+                    val updated = pageImages + newImg
+                    pageImages = updated
+                    selectedImageId = newImg.id
+                    repository.savePageImages(targetPage.id, updated)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Image inserted", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "Failed to insert image", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
 
     // Audio Subsystem
     val audioRecorder = remember { AudioNoteRecorder(context) }
@@ -130,15 +191,35 @@ fun NotebookEditorScreen(
         }
     }
 
-    // Load strokes and text notes whenever currentPage changes
+    // Load strokes, text notes, and images whenever currentPage changes
     LaunchedEffect(currentPage?.id) {
         currentPage?.id?.let { pageId ->
             val loadedStrokes = repository.loadPageStrokes(pageId)
             currentStrokes = loadedStrokes
             val loadedTexts = repository.loadPageTexts(pageId)
             pageTexts = loadedTexts
+            val loadedImages = repository.loadPageImages(pageId)
+            pageImages = loadedImages
             inkEngine.clearHistory()
             selectedStrokes = emptySet()
+            selectedImageId = null
+        }
+    }
+
+    // Decode bitmaps for any newly loaded images
+    LaunchedEffect(pageImages) {
+        withContext(Dispatchers.IO) {
+            for (img in pageImages) {
+                if (!imageBitmaps.containsKey(img.filePath)) {
+                    val f = File(img.filePath)
+                    if (f.exists()) {
+                        val bmp = BitmapFactory.decodeFile(f.absolutePath)
+                        if (bmp != null) {
+                            imageBitmaps[img.filePath] = bmp
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -309,6 +390,8 @@ fun NotebookEditorScreen(
                                             document = document ?: return@launch,
                                             pages = pages,
                                             strokeProvider = { pageId -> repository.loadPageStrokes(pageId) },
+                                            imageProvider = { pageId -> repository.loadPageImages(pageId) },
+                                            textProvider = { pageId -> repository.loadPageTexts(pageId) },
                                             outputFile = exportFile
                                         )
                                         withContext(Dispatchers.Main) {
@@ -365,17 +448,58 @@ fun NotebookEditorScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                if (inkEngine.currentTool == ToolType.PAN) {
-                                    zoomScale = (zoomScale * zoom).coerceIn(0.5f, 4.0f)
-                                    panOffset += pan
-                                }
-                            }
-                        }
                         .pointerInteropFilter { motionEvent ->
+                            // 1. Multi-touch handling: 2+ fingers for seamless Pinch-Zoom and Pan
+                            if (motionEvent.pointerCount >= 2) {
+                                val x0 = motionEvent.getX(0)
+                                val y0 = motionEvent.getY(0)
+                                val x1 = motionEvent.getX(1)
+                                val y1 = motionEvent.getY(1)
+                                val dist = hypot(x1 - x0, y1 - y0)
+                                val mid = Offset((x0 + x1) / 2f, (y0 + y1) / 2f)
+
+                                when (motionEvent.actionMasked) {
+                                    MotionEvent.ACTION_POINTER_DOWN -> {
+                                        isPinching = true
+                                        lastPinchDist = dist
+                                        lastPinchMid = mid
+                                        // Cancel in-progress strokes cleanly
+                                        inkEngine.cancelStroke()
+                                        activeStrokeState = null
+                                        shapeStartPoint = null
+                                        shapeCurrentPoint = null
+                                    }
+                                    MotionEvent.ACTION_MOVE -> {
+                                        if (isPinching && lastPinchDist > 10f) {
+                                            val factor = dist / lastPinchDist
+                                            zoomScale = (zoomScale * factor).coerceIn(0.5f, 4.0f)
+                                            panOffset += (mid - lastPinchMid)
+                                            lastPinchDist = dist
+                                            lastPinchMid = mid
+                                        }
+                                    }
+                                    MotionEvent.ACTION_POINTER_UP -> {
+                                        if (motionEvent.pointerCount <= 2) {
+                                            isPinching = false
+                                        }
+                                    }
+                                }
+                                return@pointerInteropFilter true
+                            }
+
+                            // 2. Single-touch / Stylus Input
+                            if (isPinching) {
+                                if (motionEvent.actionMasked == MotionEvent.ACTION_UP || motionEvent.actionMasked == MotionEvent.ACTION_CANCEL) {
+                                    isPinching = false
+                                }
+                                return@pointerInteropFilter true
+                            }
+
                             val isStylus = motionEvent.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS
-                            // If stylus-only mode is active and pointer is a finger, do not draw
+                            val isStylusEraser = (motionEvent.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0) ||
+                                    motionEvent.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+
+                            // Palm Rejection: If stylus-only mode is active and pointer is a finger, ignore touches unless PAN tool
                             if (isStylusOnlyMode && !isStylus && inkEngine.currentTool != ToolType.PAN) {
                                 return@pointerInteropFilter false
                             }
@@ -388,11 +512,49 @@ fun NotebookEditorScreen(
                                 touchX, touchY, originX, originY, panOffset.x, panOffset.y, totalScale
                             )
 
+                            val effectiveTool = if (isStylusEraser) ToolType.ERASER_STROKE else inkEngine.currentTool
+
                             when (motionEvent.actionMasked) {
                                 MotionEvent.ACTION_DOWN -> {
-                                    when (inkEngine.currentTool) {
+                                    // Check if selected image corner resize handle was touched
+                                    if (selectedImage != null && !selectedImage.isLocked) {
+                                        val handleX = selectedImage.x + selectedImage.width
+                                        val handleY = selectedImage.y + selectedImage.height
+                                        val distHandle = hypot(docX - handleX, docY - handleY)
+                                        if (distHandle < 36f / totalScale) {
+                                            isResizingImage = true
+                                            imageDragStartPoint = Pair(docX, docY)
+                                            initialImageBounds = Triple(selectedImage.x, selectedImage.y, Pair(selectedImage.width, selectedImage.height))
+                                            return@pointerInteropFilter true
+                                        }
+
+                                        // Check if inside selected image body (to drag move)
+                                        if (docX in selectedImage.x..(selectedImage.x + selectedImage.width) &&
+                                            docY in selectedImage.y..(selectedImage.y + selectedImage.height) &&
+                                            effectiveTool != ToolType.PEN && effectiveTool != ToolType.BALLPOINT &&
+                                            effectiveTool != ToolType.PENCIL && effectiveTool != ToolType.HIGHLIGHTER
+                                        ) {
+                                            isDraggingImage = true
+                                            imageDragStartPoint = Pair(docX, docY)
+                                            initialImageBounds = Triple(selectedImage.x, selectedImage.y, Pair(selectedImage.width, selectedImage.height))
+                                            return@pointerInteropFilter true
+                                        }
+                                    }
+
+                                    // If not resizing/dragging image, check if another image was tapped (when in PAN or LASSO mode)
+                                    if (effectiveTool == ToolType.PAN || effectiveTool == ToolType.LASSO) {
+                                        val tappedImg = pageImages.lastOrNull { img ->
+                                            docX in img.x..(img.x + img.width) && docY in img.y..(img.y + img.height)
+                                        }
+                                        if (tappedImg != null) {
+                                            selectedImageId = tappedImg.id
+                                            return@pointerInteropFilter true
+                                        }
+                                    }
+
+                                    when (effectiveTool) {
                                         ToolType.ERASER_STROKE -> {
-                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 18f / totalScale, currentStrokes)
+                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, currentStrokes)
                                             currentStrokes = remaining
                                             coroutineScope.launch {
                                                 currentPage?.id?.let { repository.savePageStrokes(it, remaining) }
@@ -406,10 +568,16 @@ fun NotebookEditorScreen(
                                             pendingTextInsertDocCoords = Pair(docX, docY)
                                             showInsertTextDialog = true
                                         }
+                                        ToolType.SHAPE -> {
+                                            shapeStartPoint = Pair(docX, docY)
+                                            shapeCurrentPoint = Pair(docX, docY)
+                                        }
                                         ToolType.PAN -> {
-                                            // Managed by gesture detector
+                                            imageDragStartPoint = Pair(touchX, touchY)
                                         }
                                         else -> {
+                                            // PEN, BALLPOINT, PENCIL, HIGHLIGHTER
+                                            selectedImageId = null // Deselect image when writing
                                             val currentAudioTime = if (recordingState == RecordingState.RECORDING) {
                                                 audioRecorder.currentTimestampMs
                                             } else null
@@ -421,9 +589,33 @@ fun NotebookEditorScreen(
                                     true
                                 }
                                 MotionEvent.ACTION_MOVE -> {
-                                    when (inkEngine.currentTool) {
+                                    if (isResizingImage && selectedImage != null && initialImageBounds != null && imageDragStartPoint != null) {
+                                        val dx = docX - imageDragStartPoint!!.first
+                                        val dy = docY - imageDragStartPoint!!.second
+                                        val initW = initialImageBounds!!.third.first
+                                        val initH = initialImageBounds!!.third.second
+                                        val newW = (initW + dx).coerceAtLeast(50f)
+                                        val newH = (initH + dy).coerceAtLeast(50f)
+                                        pageImages = pageImages.map {
+                                            if (it.id == selectedImage.id) it.copy(width = newW, height = newH) else it
+                                        }
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    if (isDraggingImage && selectedImage != null && initialImageBounds != null && imageDragStartPoint != null) {
+                                        val dx = docX - imageDragStartPoint!!.first
+                                        val dy = docY - imageDragStartPoint!!.second
+                                        val initX = initialImageBounds!!.first
+                                        val initY = initialImageBounds!!.second
+                                        pageImages = pageImages.map {
+                                            if (it.id == selectedImage.id) it.copy(x = initX + dx, y = initY + dy) else it
+                                        }
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    when (effectiveTool) {
                                         ToolType.ERASER_STROKE -> {
-                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 18f / totalScale, currentStrokes)
+                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, currentStrokes)
                                             currentStrokes = remaining
                                         }
                                         ToolType.LASSO -> {
@@ -431,8 +623,16 @@ fun NotebookEditorScreen(
                                                 lassoPoints = lassoPoints + Pair(docX, docY)
                                             }
                                         }
+                                        ToolType.SHAPE -> {
+                                            shapeCurrentPoint = Pair(docX, docY)
+                                        }
                                         ToolType.PAN -> {
-                                            // Pan gesture
+                                            imageDragStartPoint?.let { start ->
+                                                val dx = touchX - start.first
+                                                val dy = touchY - start.second
+                                                panOffset += Offset(dx, dy)
+                                                imageDragStartPoint = Pair(touchX, touchY)
+                                            }
                                         }
                                         else -> {
                                             inkEngine.continueStroke(docX, docY, pressure)
@@ -442,7 +642,18 @@ fun NotebookEditorScreen(
                                     true
                                 }
                                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                    when (inkEngine.currentTool) {
+                                    if (isResizingImage || isDraggingImage) {
+                                        isResizingImage = false
+                                        isDraggingImage = false
+                                        imageDragStartPoint = null
+                                        initialImageBounds = null
+                                        coroutineScope.launch {
+                                            currentPage?.id?.let { repository.savePageImages(it, pageImages) }
+                                        }
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    when (effectiveTool) {
                                         ToolType.ERASER_STROKE -> {
                                             coroutineScope.launch {
                                                 currentPage?.id?.let { repository.savePageStrokes(it, currentStrokes) }
@@ -455,15 +666,36 @@ fun NotebookEditorScreen(
                                                 isLassoActive = false
                                             }
                                         }
+                                        ToolType.SHAPE -> {
+                                            shapeStartPoint?.let { start ->
+                                                val createdStroke = ShapeFactory.createPresetShape(
+                                                    type = selectedPresetShape,
+                                                    startX = start.first,
+                                                    startY = start.second,
+                                                    endX = docX,
+                                                    endY = docY,
+                                                    color = inkEngine.currentColor,
+                                                    width = inkEngine.currentWidth,
+                                                    opacity = inkEngine.currentOpacity
+                                                )
+                                                val updated = currentStrokes + createdStroke
+                                                currentStrokes = updated
+                                                coroutineScope.launch {
+                                                    currentPage?.id?.let { repository.savePageStrokes(it, updated) }
+                                                }
+                                            }
+                                            shapeStartPoint = null
+                                            shapeCurrentPoint = null
+                                        }
                                         ToolType.PAN, ToolType.TEXT -> {
-                                            // No stroke action
+                                            imageDragStartPoint = null
                                         }
                                         else -> {
                                             var completed = inkEngine.finishStroke()
                                             activeStrokeState = null
 
                                             if (completed != null) {
-                                                // If Shape Auto-Recognition is enabled, snap shapes!
+                                                // AutoShape recognition snapping if enabled
                                                 if (isShapeSnapEnabled) {
                                                     val recognized = ShapeRecognizer.recognize(completed)
                                                     if (recognized.type != RecognizedShapeType.NONE) {
@@ -496,16 +728,16 @@ fun NotebookEditorScreen(
                                 transformOrigin = TransformOrigin(0f, 0f)
                             }
                     ) {
-                        // 1. Draw Page Canvas Surface with Border & Shadow
+                        // 1. Draw Page Canvas Surface
                         drawRect(
                             color = Color.White,
                             topLeft = Offset.Zero,
                             size = Size(pageW, pageH)
                         )
 
-                        // Page outline
+                        // Page outline border
                         drawRect(
-                            color = Color(0xFFE2E8F0),
+                            color = Color(0xFFCBD5E1),
                             topLeft = Offset.Zero,
                             size = Size(pageW, pageH),
                             style = Stroke(width = 1f)
@@ -525,7 +757,79 @@ fun NotebookEditorScreen(
                             }
                         }
 
-                        // 4. Draw Committed Vector Strokes
+                        // 4. Draw Inserted Images (underneath handwriting)
+                        for (img in pageImages) {
+                            val bmp = imageBitmaps[img.filePath]
+                            if (bmp != null) {
+                                drawContext.canvas.save()
+                                val cx = img.x + img.width / 2f
+                                val cy = img.y + img.height / 2f
+                                drawContext.canvas.translate(cx, cy)
+                                if (img.rotationDegrees != 0f) {
+                                    drawContext.canvas.rotate(img.rotationDegrees)
+                                }
+                                val scaleX = if (img.isFlippedHorizontal) -1f else 1f
+                                val scaleY = if (img.isFlippedVertical) -1f else 1f
+                                if (scaleX != 1f || scaleY != 1f) {
+                                    drawContext.canvas.scale(scaleX, scaleY)
+                                }
+                                drawContext.canvas.translate(-img.width / 2f, -img.height / 2f)
+
+                                drawImage(
+                                    image = bmp.asImageBitmap(),
+                                    dstOffset = androidx.compose.ui.unit.IntOffset.Zero,
+                                    dstSize = androidx.compose.ui.unit.IntSize(img.width.toInt(), img.height.toInt()),
+                                    alpha = img.opacity
+                                )
+                                drawContext.canvas.restore()
+                            }
+                        }
+
+                        // 5. Draw Selected Image Bounding Box & Handles
+                        selectedImage?.let { img ->
+                            drawRect(
+                                color = Color(0xFF2563EB),
+                                topLeft = Offset(img.x, img.y),
+                                size = Size(img.width, img.height),
+                                style = Stroke(
+                                    width = 2f / totalScale,
+                                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f / totalScale, 8f / totalScale), 0f)
+                                )
+                            )
+
+                            // 4 Corner Handles
+                            val handleR = 6f / totalScale
+                            val corners = listOf(
+                                Offset(img.x, img.y),
+                                Offset(img.x + img.width, img.y),
+                                Offset(img.x, img.y + img.height),
+                                Offset(img.x + img.width, img.y + img.height)
+                            )
+                            for (c in corners) {
+                                drawCircle(color = Color.White, radius = handleR, center = c)
+                                drawCircle(color = Color(0xFF2563EB), radius = handleR, center = c, style = Stroke(width = 2f / totalScale))
+                            }
+
+                            // Top Rotate Knob
+                            val topMid = Offset(img.x + img.width / 2f, img.y)
+                            val rotKnob = Offset(img.x + img.width / 2f, img.y - 20f / totalScale)
+                            drawLine(color = Color(0xFF2563EB), start = topMid, end = rotKnob, strokeWidth = 1.5f / totalScale)
+                            drawCircle(color = Color(0xFF2563EB), radius = handleR, center = rotKnob)
+                        }
+
+                        // 6. Draw Placed Page Text Objects
+                        for (txt in pageTexts) {
+                            txt.backgroundColor?.let { bgCol ->
+                                drawRoundRect(
+                                    color = Color(bgCol.toInt()),
+                                    topLeft = Offset(txt.x - 4f, txt.y - 2f),
+                                    size = Size(txt.text.length * txt.fontSizeSp * 0.65f + 12f, txt.fontSizeSp * 1.6f),
+                                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(4f, 4f)
+                                )
+                            }
+                        }
+
+                        // 7. Draw Committed Vector Strokes
                         for (stroke in currentStrokes) {
                             if (stroke.points.size < 2) continue
 
@@ -559,7 +863,7 @@ fun NotebookEditorScreen(
                             )
                         }
 
-                        // 5. Draw Active Live Stroke
+                        // 8. Draw Active Live Inking Stroke
                         activeStrokeState?.let { active ->
                             if (active.points.size >= 2) {
                                 val livePath = androidx.compose.ui.graphics.Path()
@@ -581,7 +885,39 @@ fun NotebookEditorScreen(
                             }
                         }
 
-                        // 6. Draw Lasso Selection Outline
+                        // 9. Draw Live Preset Shape Preview
+                        if (shapeStartPoint != null && shapeCurrentPoint != null) {
+                            val (sX, sY) = shapeStartPoint!!
+                            val (cX, cY) = shapeCurrentPoint!!
+                            val previewStroke = ShapeFactory.createPresetShape(
+                                type = selectedPresetShape,
+                                startX = sX,
+                                startY = sY,
+                                endX = cX,
+                                endY = cY,
+                                color = inkEngine.currentColor,
+                                width = inkEngine.currentWidth
+                            )
+                            if (previewStroke.points.size >= 2) {
+                                val previewPath = androidx.compose.ui.graphics.Path()
+                                previewPath.moveTo(previewStroke.points[0].x, previewStroke.points[0].y)
+                                for (i in 1 until previewStroke.points.size) {
+                                    previewPath.lineTo(previewStroke.points[i].x, previewStroke.points[i].y)
+                                }
+                                drawPath(
+                                    path = previewPath,
+                                    color = Color(inkEngine.currentColor.toInt()).copy(alpha = 0.85f),
+                                    style = Stroke(
+                                        width = inkEngine.currentWidth,
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f),
+                                        cap = StrokeCap.Round,
+                                        join = StrokeJoin.Round
+                                    )
+                                )
+                            }
+                        }
+
+                        // 10. Draw Lasso Selection Outline
                         if (isLassoActive && lassoPoints.size >= 2) {
                             val lassoPath = androidx.compose.ui.graphics.Path()
                             lassoPath.moveTo(lassoPoints[0].first, lassoPoints[0].second)
@@ -598,31 +934,104 @@ fun NotebookEditorScreen(
                             )
                         }
                     }
+                }
 
-                    // Render Placed Page Text Objects
-                    for (textObj in pageTexts) {
-                        Surface(
-                            modifier = Modifier
-                                .offset(
-                                    x = ((originX + panOffset.x) / totalScale + textObj.x).dp,
-                                    y = ((originY + panOffset.y) / totalScale + textObj.y).dp
-                                )
-                                .shadow(2.dp, RoundedCornerShape(6.dp)),
-                            shape = RoundedCornerShape(6.dp),
-                            color = textObj.backgroundColor?.let { Color(it.toInt()) } ?: Color.White
+                // Floating Image Contextual Toolbar (when an image is selected)
+                selectedImage?.let { img ->
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(top = 16.dp)
+                            .shadow(8.dp, RoundedCornerShape(16.dp)),
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = textObj.text,
-                                fontSize = textObj.fontSizeSp.sp,
-                                color = Color(textObj.color.toInt()),
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                text = "Image",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontSize = 13.sp
                             )
+
+                            // Rotate 90 deg clockwise
+                            IconButton(onClick = {
+                                val updated = pageImages.map {
+                                    if (it.id == img.id) it.copy(rotationDegrees = (it.rotationDegrees + 90f) % 360f) else it
+                                }
+                                pageImages = updated
+                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                            }) {
+                                Icon(Icons.Default.RotateRight, contentDescription = "Rotate", modifier = Modifier.size(18.dp))
+                            }
+
+                            // Flip Horizontal
+                            IconButton(onClick = {
+                                val updated = pageImages.map {
+                                    if (it.id == img.id) it.copy(isFlippedHorizontal = !it.isFlippedHorizontal) else it
+                                }
+                                pageImages = updated
+                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                            }) {
+                                Icon(Icons.Default.Flip, contentDescription = "Flip Horizontal", modifier = Modifier.size(18.dp))
+                            }
+
+                            // Lock / Unlock
+                            IconButton(onClick = {
+                                val updated = pageImages.map {
+                                    if (it.id == img.id) it.copy(isLocked = !it.isLocked) else it
+                                }
+                                pageImages = updated
+                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                            }) {
+                                Icon(
+                                    imageVector = if (img.isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
+                                    contentDescription = "Lock",
+                                    tint = if (img.isLocked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+
+                            // Duplicate
+                            IconButton(onClick = {
+                                val copy = img.copy(
+                                    id = UUID.randomUUID().toString(),
+                                    x = img.x + 20f,
+                                    y = img.y + 20f
+                                )
+                                val updated = pageImages + copy
+                                pageImages = updated
+                                selectedImageId = copy.id
+                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                            }) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate", modifier = Modifier.size(18.dp))
+                            }
+
+                            // Delete Image
+                            IconButton(onClick = {
+                                val updated = pageImages.filter { it.id != img.id }
+                                pageImages = updated
+                                selectedImageId = null
+                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                            }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
+                            }
+
+                            // Close / Deselect
+                            IconButton(onClick = { selectedImageId = null }) {
+                                Icon(Icons.Default.Close, contentDescription = "Deselect", modifier = Modifier.size(18.dp))
+                            }
                         }
                     }
                 }
 
-                // Lasso Selection Action Bar (if strokes are selected)
-                if (selectedStrokes.isNotEmpty()) {
+                // Lasso Selection Action Bar (when strokes are selected)
+                if (selectedStrokes.isNotEmpty() && selectedImage == null) {
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -650,7 +1059,7 @@ fun NotebookEditorScreen(
                                 currentStrokes = updated
                                 coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
                             }) {
-                                Icon(Icons.Default.ArrowBack, contentDescription = "Move Left", modifier = Modifier.size(18.dp))
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Move Left", modifier = Modifier.size(18.dp))
                             }
                             // Move Right
                             IconButton(onClick = {
@@ -658,7 +1067,7 @@ fun NotebookEditorScreen(
                                 currentStrokes = updated
                                 coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
                             }) {
-                                Icon(Icons.Default.ArrowForward, contentDescription = "Move Right", modifier = Modifier.size(18.dp))
+                                Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Move Right", modifier = Modifier.size(18.dp))
                             }
                             // Move Up
                             IconButton(onClick = {
@@ -698,31 +1107,138 @@ fun NotebookEditorScreen(
                     }
                 }
 
+                // Floating Viewport Zoom Controls (Bottom Right)
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 96.dp)
+                        .shadow(8.dp, RoundedCornerShape(16.dp)),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        IconButton(
+                            onClick = { zoomScale = (zoomScale / 1.2f).coerceIn(0.5f, 4.0f) },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Default.ZoomOut, contentDescription = "Zoom Out", modifier = Modifier.size(16.dp))
+                        }
+
+                        Text(
+                            text = "${(zoomScale * 100).toInt()}%",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .clickable {
+                                    zoomScale = 1.0f
+                                    panOffset = Offset.Zero
+                                }
+                                .padding(horizontal = 4.dp)
+                        )
+
+                        IconButton(
+                            onClick = { zoomScale = (zoomScale * 1.2f).coerceIn(0.5f, 4.0f) },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Default.ZoomIn, contentDescription = "Zoom In", modifier = Modifier.size(16.dp))
+                        }
+
+                        VerticalDivider(modifier = Modifier.height(18.dp))
+
+                        // Fit Page
+                        IconButton(
+                            onClick = {
+                                zoomScale = 1.0f
+                                panOffset = Offset.Zero
+                            },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Default.FitScreen, contentDescription = "Fit Page", modifier = Modifier.size(16.dp))
+                        }
+
+                        // Fit Width
+                        IconButton(
+                            onClick = {
+                                val targetScale = (availableW - margin * 2) / (pageW * fitScale)
+                                zoomScale = targetScale.coerceIn(0.5f, 4.0f)
+                                panOffset = Offset.Zero
+                            },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Default.AspectRatio, contentDescription = "Fit Width", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+
+                // Preset Shape Dropdown Menu (when Shape Tool is tapped)
+                if (showPresetShapeMenu) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 90.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            shadowElevation = 12.dp,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                listOf(
+                                    Pair(PresetShapeType.RECTANGLE, "Rectangle"),
+                                    Pair(PresetShapeType.ROUNDED_RECTANGLE, "Round Rect"),
+                                    Pair(PresetShapeType.CIRCLE, "Circle"),
+                                    Pair(PresetShapeType.LINE, "Line"),
+                                    Pair(PresetShapeType.ARROW, "Arrow"),
+                                    Pair(PresetShapeType.TRIANGLE, "Triangle"),
+                                    Pair(PresetShapeType.STAR, "Star")
+                                ).forEach { (shape, name) ->
+                                    val isCur = selectedPresetShape == shape
+                                    FilterChip(
+                                        selected = isCur,
+                                        onClick = {
+                                            selectedPresetShape = shape
+                                            inkEngine.currentTool = ToolType.SHAPE
+                                            showPresetShapeMenu = false
+                                        },
+                                        label = { Text(name, fontSize = 12.sp) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Floating Inking Toolbar Dock
                 Surface(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 24.dp)
+                        .padding(bottom = 20.dp)
                         .shadow(16.dp, RoundedCornerShape(24.dp)),
                     shape = RoundedCornerShape(24.dp),
                     color = MaterialTheme.colorScheme.surface,
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        // Tool Buttons: Pen, Ballpoint, Pencil, Highlighter, Eraser, Lasso, Text, Pan
+                        // Inking Tools: Pen, Ballpoint, Pencil, Highlighter, Eraser
                         listOf(
                             Triple(ToolType.PEN, Icons.Default.Edit, "Fountain Pen"),
                             Triple(ToolType.BALLPOINT, Icons.Default.DriveFileRenameOutline, "Ballpoint"),
                             Triple(ToolType.PENCIL, Icons.Default.Create, "Pencil"),
                             Triple(ToolType.HIGHLIGHTER, Icons.Default.BorderColor, "Highlighter"),
-                            Triple(ToolType.ERASER_STROKE, Icons.Default.AutoFixNormal, "Eraser"),
-                            Triple(ToolType.LASSO, Icons.Default.Gesture, "Lasso Select"),
-                            Triple(ToolType.TEXT, Icons.Default.TextFields, "Text Note"),
-                            Triple(ToolType.PAN, Icons.Default.PanTool, "Pan & Zoom")
+                            Triple(ToolType.ERASER_STROKE, Icons.Default.AutoFixNormal, "Eraser")
                         ).forEach { (tool, icon, label) ->
                             val isSelected = inkEngine.currentTool == tool
                             IconButton(
@@ -745,14 +1261,93 @@ fun NotebookEditorScreen(
                             }
                         }
 
-                        VerticalDivider(modifier = Modifier.height(28.dp))
+                        // Preset Shape Tool
+                        val isShapeActive = inkEngine.currentTool == ToolType.SHAPE
+                        IconButton(
+                            onClick = {
+                                if (isShapeActive) {
+                                    showPresetShapeMenu = !showPresetShapeMenu
+                                } else {
+                                    inkEngine.currentTool = ToolType.SHAPE
+                                    showPresetShapeMenu = true
+                                }
+                            },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(if (isShapeActive) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Category,
+                                contentDescription = "Shapes",
+                                tint = if (isShapeActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
 
-                        // Color Palette Swatches (first 6 colors)
-                        palette.take(6).forEach { c ->
+                        // Lasso Tool
+                        val isLassoSelected = inkEngine.currentTool == ToolType.LASSO
+                        IconButton(
+                            onClick = { inkEngine.currentTool = ToolType.LASSO },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(if (isLassoSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Gesture,
+                                contentDescription = "Lasso Select",
+                                tint = if (isLassoSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        // Insert Image Button
+                        IconButton(
+                            onClick = { imagePickerLauncher.launch("image/*") },
+                            modifier = Modifier.clip(CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Image,
+                                contentDescription = "Insert Image",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        // Insert Text Button
+                        val isTextSelected = inkEngine.currentTool == ToolType.TEXT
+                        IconButton(
+                            onClick = { inkEngine.currentTool = ToolType.TEXT },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(if (isTextSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.TextFields,
+                                contentDescription = "Text Note",
+                                tint = if (isTextSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        // Pan / Navigation Tool
+                        val isPanSelected = inkEngine.currentTool == ToolType.PAN
+                        IconButton(
+                            onClick = { inkEngine.currentTool = ToolType.PAN },
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(if (isPanSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PanTool,
+                                contentDescription = "Pan & Zoom",
+                                tint = if (isPanSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        VerticalDivider(modifier = Modifier.height(26.dp))
+
+                        // Color Palette Swatches (first 5 colors)
+                        palette.take(5).forEach { c ->
                             val isColorSelected = inkEngine.currentColor == c
                             Box(
                                 modifier = Modifier
-                                    .size(24.dp)
+                                    .size(22.dp)
                                     .clip(CircleShape)
                                     .background(Color(c.toInt()))
                                     .border(
@@ -769,20 +1364,20 @@ fun NotebookEditorScreen(
                             onClick = { showCustomColorDialog = true },
                             modifier = Modifier.size(28.dp)
                         ) {
-                            Icon(Icons.Default.Palette, contentDescription = "Custom Color", modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.Palette, contentDescription = "Custom Color", modifier = Modifier.size(16.dp))
                         }
 
-                        VerticalDivider(modifier = Modifier.height(28.dp))
+                        VerticalDivider(modifier = Modifier.height(26.dp))
 
                         // Tool Properties Dialog button (Width, Palm Rejection, Shape Snapping)
                         IconButton(
                             onClick = { showToolPropertiesDialog = true },
-                            modifier = Modifier.size(32.dp)
+                            modifier = Modifier.size(30.dp)
                         ) {
                             Icon(Icons.Default.Tune, contentDescription = "Tool Settings", modifier = Modifier.size(18.dp))
                         }
 
-                        VerticalDivider(modifier = Modifier.height(28.dp))
+                        VerticalDivider(modifier = Modifier.height(26.dp))
 
                         // Undo & Redo Controls
                         IconButton(
@@ -793,9 +1388,10 @@ fun NotebookEditorScreen(
                                 coroutineScope.launch {
                                     currentPage?.id?.let { repository.savePageStrokes(it, undone) }
                                 }
-                            }
+                            },
+                            modifier = Modifier.size(30.dp)
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo")
+                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo", modifier = Modifier.size(18.dp))
                         }
 
                         IconButton(
@@ -806,9 +1402,10 @@ fun NotebookEditorScreen(
                                 coroutineScope.launch {
                                     currentPage?.id?.let { repository.savePageStrokes(it, redone) }
                                 }
-                            }
+                            },
+                            modifier = Modifier.size(30.dp)
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "Redo")
+                            Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "Redo", modifier = Modifier.size(18.dp))
                         }
                     }
                 }

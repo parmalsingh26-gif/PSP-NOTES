@@ -65,6 +65,40 @@ class ShapeRecognizerTest {
     }
 
     @Test
+    fun testRectangleRecognition() {
+        // Points roughly on a rectangle with corners (20, 20) and (120, 80)
+        val points = mutableListOf<InkPoint>()
+        // Top edge: (20, 20) to (120, 20)
+        points.add(InkPoint(20f, 20f))
+        points.add(InkPoint(70f, 20.5f))
+        points.add(InkPoint(120f, 20f))
+        // Right edge: (120, 20) to (120, 80)
+        points.add(InkPoint(119.5f, 50f))
+        points.add(InkPoint(120f, 80f))
+        // Bottom edge: (120, 80) to (20, 80)
+        points.add(InkPoint(70f, 79.5f))
+        points.add(InkPoint(20f, 80f))
+        // Left edge: (20, 80) to (20, 20)
+        points.add(InkPoint(20.5f, 50f))
+        points.add(InkPoint(20f, 20f))
+
+        val stroke = InkStroke(
+            id = "test-rect",
+            tool = ToolType.PEN,
+            color = 0xFF000000,
+            width = 2f,
+            points = points
+        )
+
+        val result = ShapeRecognizer.recognize(stroke)
+        assertEquals(RecognizedShapeType.RECTANGLE, result.type)
+        assertEquals(5, result.snappedStroke.points.size)
+        assertEquals(20f, result.snappedStroke.points[0].x, 0.5f)
+        assertEquals(20f, result.snappedStroke.points[0].y, 0.5f)
+        assertEquals(120f, result.snappedStroke.points[1].x, 0.5f)
+    }
+
+    @Test
     fun testRandomSquiggleIsNotRecognized() {
         val points = listOf(
             InkPoint(10f, 10f),
@@ -85,3 +119,4 @@ class ShapeRecognizerTest {
         assertEquals(RecognizedShapeType.NONE, result.type)
     }
 }
+

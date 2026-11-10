@@ -313,6 +313,18 @@ class DocumentRepository(
         strokeFileStore.loadPageTexts(pageId)
     }
 
+    suspend fun savePageImages(pageId: String, images: List<PageImageObject>) = withContext(Dispatchers.IO) {
+        strokeFileStore.savePageImages(pageId, images)
+    }
+
+    suspend fun loadPageImages(pageId: String): List<PageImageObject> = withContext(Dispatchers.IO) {
+        strokeFileStore.loadPageImages(pageId)
+    }
+
+    suspend fun copyImageFromUri(uri: Uri): String = withContext(Dispatchers.IO) {
+        strokeFileStore.copyImageFromUri(uri)
+    }
+
     suspend fun saveWhiteboardObjects(documentId: String, objects: List<CanvasObject>) = withContext(Dispatchers.IO) {
         strokeFileStore.saveWhiteboardObjects(documentId, objects)
     }

@@ -70,3 +70,4 @@ In `DocumentRepository.createPdfDocument`:
    ```
 5. Insert entities for all $N$ pages!
 6. Close renderer.
+

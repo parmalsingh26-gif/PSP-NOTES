@@ -10,3 +10,4 @@ data class PageTextObject(
     val color: Long = 0xFF0F172A,
     val backgroundColor: Long? = 0x80FEF08A // Translucent soft yellow
 )
+

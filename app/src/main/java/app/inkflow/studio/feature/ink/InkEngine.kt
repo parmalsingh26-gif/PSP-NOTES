@@ -16,6 +16,13 @@ class InkEngine {
     var currentColor: Long = 0xFF1E293B // Dark slate default
     var currentWidth: Float = 2.5f
 
+    val currentOpacity: Float
+        get() = when (currentTool) {
+            ToolType.HIGHLIGHTER -> 0.35f
+            ToolType.PENCIL -> 0.75f
+            else -> 1.0f
+        }
+
     private val undoStack = ArrayDeque<InkCommand>()
     private val redoStack = ArrayDeque<InkCommand>()
 
@@ -104,6 +111,11 @@ class InkEngine {
             return stroke
         }
         return null
+    }
+
+    fun cancelStroke() {
+        currentPoints.clear()
+        activeStroke = null
     }
 
     fun eraseAt(docX: Float, docY: Float, radius: Float, existingStrokes: List<InkStroke>): Pair<List<InkStroke>, List<InkStroke>> {

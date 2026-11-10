@@ -58,6 +58,37 @@ object ShapeRecognizer {
                 val snapped = stroke.copy(points = circlePoints)
                 return RecognizedShape(RecognizedShapeType.CIRCLE, snapped)
             }
+
+            // 1b. Check for Rectangle: points closely conform to bounding box perimeter
+            val minX = points.minOf { it.x }
+            val maxX = points.maxOf { it.x }
+            val minY = points.minOf { it.y }
+            val maxY = points.maxOf { it.y }
+            val w = maxX - minX
+            val h = maxY - minY
+            if (w > 20f && h > 20f) {
+                var totalEdgeDist = 0f
+                for (p in points) {
+                    val distLeft = abs(p.x - minX)
+                    val distRight = abs(p.x - maxX)
+                    val distTop = abs(p.y - minY)
+                    val distBottom = abs(p.y - maxY)
+                    val minEdgeDist = minOf(distLeft, distRight, distTop, distBottom)
+                    totalEdgeDist += minEdgeDist
+                }
+                val avgEdgeDist = totalEdgeDist / points.size
+                if (avgEdgeDist / approxDiameter < 0.15f) {
+                    val rectPoints = listOf(
+                        InkPoint(minX, minY, 1.0f),
+                        InkPoint(maxX, minY, 1.0f),
+                        InkPoint(maxX, maxY, 1.0f),
+                        InkPoint(minX, maxY, 1.0f),
+                        InkPoint(minX, minY, 1.0f)
+                    )
+                    val snapped = stroke.copy(points = rectPoints)
+                    return RecognizedShape(RecognizedShapeType.RECTANGLE, snapped)
+                }
+            }
         }
 
         // 2. Check for Straight Line
@@ -96,3 +127,4 @@ object ShapeRecognizer {
         return abs(dy * px - dx * py + x2 * y1 - y2 * x1) / len
     }
 }
+
