@@ -38,6 +38,10 @@ class StudyRepository(database: AppDatabase) {
         studyDao.insertAll(cards.map { StudyCardEntity.fromDomain(it) })
     }
 
+    suspend fun updateCard(card: StudyCard) = withContext(Dispatchers.IO) {
+        studyDao.insertOrUpdate(StudyCardEntity.fromDomain(card))
+    }
+
     suspend fun deleteCard(cardId: String) = withContext(Dispatchers.IO) {
         studyDao.deleteCard(cardId)
     }

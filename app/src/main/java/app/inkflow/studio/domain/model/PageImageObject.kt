@@ -12,5 +12,11 @@ data class PageImageObject(
     val isFlippedHorizontal: Boolean = false,
     val isFlippedVertical: Boolean = false,
     val isLocked: Boolean = false,
-    val opacity: Float = 1.0f
+    val opacity: Float = 1.0f,
+    val cropLeft: Float = 0f,
+    val cropTop: Float = 0f,
+    val cropRight: Float = 1f,
+    val cropBottom: Float = 1f,
+    val aspectRatioLocked: Boolean = true,
+    val zIndex: Int = 0
 )

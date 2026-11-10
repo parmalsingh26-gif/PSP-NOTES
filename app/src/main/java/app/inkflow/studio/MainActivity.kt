@@ -58,11 +58,26 @@ class MainActivity : ComponentActivity() {
         if (intent?.action == Intent.ACTION_VIEW) {
             val uri = intent.data
             if (uri != null && (intent.type == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true))) {
+                val resolvedTitle = extractDisplayName(uri) ?: "Imported Document"
                 lifecycleScope.launch {
-                    val doc = repository.createPdfDocument("Imported Document", uri)
-                    // Handled gracefully in library list
+                    repository.createPdfDocument(resolvedTitle, uri)
                 }
             }
+        }
+    }
+
+    private fun extractDisplayName(uri: android.net.Uri): String? {
+        return try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        cursor.getString(idx)?.removeSuffix(".pdf")?.removeSuffix(".PDF")?.trim()?.takeIf { it.isNotEmpty() }
+                    } else null
+                } else null
+            } ?: uri.lastPathSegment?.substringAfterLast('/')?.removeSuffix(".pdf")?.removeSuffix(".PDF")?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (_: Exception) {
+            null
         }
     }
 }

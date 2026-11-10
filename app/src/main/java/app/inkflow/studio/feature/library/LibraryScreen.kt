@@ -1,6 +1,7 @@
 package app.inkflow.studio.feature.library
 
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -31,9 +32,11 @@ import app.inkflow.studio.core.design.*
 import app.inkflow.studio.data.repository.DocumentRepository
 import app.inkflow.studio.domain.model.Document
 import app.inkflow.studio.domain.model.DocumentType
+import app.inkflow.studio.domain.model.Folder
 import app.inkflow.studio.domain.model.PageTemplate
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
@@ -53,24 +56,57 @@ fun LibraryScreen(
     onOpenDocument: (Document) -> Unit,
     onOpenStudy: () -> Unit
 ) {
+    val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var selectedFilter by remember { mutableStateOf(LibraryFilter.ALL) }
+    var selectedFolderId by remember { mutableStateOf<String?>(null) }
     var searchQuery by remember { mutableStateOf("") }
 
     // Dialog States
     var showCreateNotebookDialog by remember { mutableStateOf(false) }
     var showCreateWhiteboardDialog by remember { mutableStateOf(false) }
+    var showCreateFolderDialog by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf<Document?>(null) }
     var renameText by remember { mutableStateOf("") }
+    var showTagsDialog by remember { mutableStateOf<Document?>(null) }
+    var tagsInputText by remember { mutableStateOf("") }
+    var showMoveFolderDialog by remember { mutableStateOf<Document?>(null) }
+
+    // Helper to extract real filename from Uri
+    fun resolvePdfTitle(uri: Uri): String {
+        return try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        cursor.getString(idx)
+                            ?.removeSuffix(".pdf")
+                            ?.removeSuffix(".PDF")
+                            ?.trim()
+                            ?.takeIf { it.isNotEmpty() }
+                    } else null
+                } else null
+            } ?: uri.lastPathSegment
+                ?.substringAfterLast('/')
+                ?.removeSuffix(".pdf")
+                ?.removeSuffix(".PDF")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            ?: "Imported PDF"
+        } catch (_: Exception) {
+            "Imported PDF"
+        }
+    }
 
     // PDF Picker Launcher
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            val extractedTitle = resolvePdfTitle(it)
             coroutineScope.launch {
                 val doc = repository.createPdfDocument(
-                    title = "Imported Document",
+                    title = extractedTitle,
                     uri = it
                 )
                 onOpenDocument(doc)
@@ -78,10 +114,30 @@ fun LibraryScreen(
         }
     }
 
-    val context = LocalContext.current
     val app = context.applicationContext as? InkFlowApplication
     val backupManager = app?.backupManager
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var pendingBackupFile by remember { mutableStateOf<File?>(null) }
+
+    val saveBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { destUri: Uri? ->
+        val srcFile = pendingBackupFile
+        if (destUri != null && srcFile != null && srcFile.exists()) {
+            coroutineScope.launch {
+                try {
+                    context.contentResolver.openOutputStream(destUri)?.use { out ->
+                        FileInputStream(srcFile).use { input ->
+                            input.copyTo(out)
+                        }
+                    }
+                    Toast.makeText(context, "Backup exported (${srcFile.length() / 1024} KB)", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Export failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     val restoreBackupPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -99,7 +155,7 @@ fun LibraryScreen(
                     if (restored) {
                         Toast.makeText(context, "Backup restored successfully!", Toast.LENGTH_LONG).show()
                     } else {
-                        Toast.makeText(context, "Failed to restore backup", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Failed to restore backup (Checksum or schema mismatch)", Toast.LENGTH_SHORT).show()
                     }
                 } catch (e: Exception) {
                     Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -108,12 +164,13 @@ fun LibraryScreen(
         }
     }
 
-    // Reactive Document Lists
+    // Reactive Document & Folder Lists
     val activeDocs by repository.getAllActiveDocuments().collectAsState(initial = emptyList())
     val favoriteDocs by repository.getFavoriteDocuments().collectAsState(initial = emptyList())
     val trashedDocs by repository.getTrashedDocuments().collectAsState(initial = emptyList())
+    val folders by repository.getAllFolders().collectAsState(initial = emptyList())
 
-    val filteredDocs = remember(activeDocs, favoriteDocs, trashedDocs, selectedFilter, searchQuery) {
+    val filteredDocs = remember(activeDocs, favoriteDocs, trashedDocs, selectedFilter, selectedFolderId, searchQuery) {
         val baseList = when (selectedFilter) {
             LibraryFilter.ALL -> activeDocs
             LibraryFilter.NOTEBOOKS -> activeDocs.filter { it.type == DocumentType.NOTEBOOK }
@@ -122,10 +179,15 @@ fun LibraryScreen(
             LibraryFilter.FAVORITES -> favoriteDocs
             LibraryFilter.TRASH -> trashedDocs
         }
-        if (searchQuery.isBlank()) {
-            baseList
+        val folderFiltered = if (selectedFolderId != null && selectedFilter != LibraryFilter.TRASH) {
+            baseList.filter { it.folderId == selectedFolderId }
         } else {
-            baseList.filter {
+            baseList
+        }
+        if (searchQuery.isBlank()) {
+            folderFiltered
+        } else {
+            folderFiltered.filter {
                 it.title.contains(searchQuery, ignoreCase = true) ||
                         it.tags.any { tag -> tag.contains(searchQuery, ignoreCase = true) }
             }
@@ -215,14 +277,23 @@ fun LibraryScreen(
                             )
                         }
 
-                        // Action Buttons: New Notebook, Import PDF, Whiteboard
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        // Action Buttons: New Folder, Import PDF, Whiteboard, New Notebook
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(
+                                onClick = { showCreateFolderDialog = true },
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Folder")
+                            }
+
                             OutlinedButton(
                                 onClick = { pdfPickerLauncher.launch(arrayOf("application/pdf")) },
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Text("Import PDF")
                             }
 
@@ -231,7 +302,7 @@ fun LibraryScreen(
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Default.Dashboard, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Text("Whiteboard")
                             }
 
@@ -240,15 +311,15 @@ fun LibraryScreen(
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Text("New Notebook")
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
 
-                    // Search & Filter Bar
+                    // Search & Type Filter Bar
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -257,7 +328,7 @@ fun LibraryScreen(
                         OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
-                            placeholder = { Text("Search by title or tag…") },
+                            placeholder = { Text("Search by title or #tag…") },
                             leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
                             trailingIcon = {
                                 if (searchQuery.isNotEmpty()) {
@@ -290,6 +361,47 @@ fun LibraryScreen(
                                 onClick = { selectedFilter = LibraryFilter.PDFS },
                                 label = { Text("PDFs") }
                             )
+                        }
+                    }
+
+                    // Folder Filter Bar (if user created folders)
+                    if (folders.isNotEmpty() && selectedFilter != LibraryFilter.TRASH) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Outlined.FolderOpen,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FilterChip(
+                                selected = selectedFolderId == null,
+                                onClick = { selectedFolderId = null },
+                                label = { Text("All Folders") }
+                            )
+                            folders.forEach { folder ->
+                                FilterChip(
+                                    selected = selectedFolderId == folder.id,
+                                    onClick = {
+                                        selectedFolderId = if (selectedFolderId == folder.id) null else folder.id
+                                    },
+                                    leadingIcon = {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(10.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(folder.color.toULong()))
+                                        )
+                                    },
+                                    label = { Text(folder.name) }
+                                )
+                            }
                         }
                     }
                 }
@@ -339,8 +451,12 @@ fun LibraryScreen(
                         modifier = Modifier.fillMaxSize()
                     ) {
                         items(filteredDocs, key = { it.id }) { doc ->
+                            val folderName = remember(doc.folderId, folders) {
+                                folders.find { it.id == doc.folderId }?.name
+                            }
                             DocumentCard(
                                 document = doc,
+                                folderName = folderName,
                                 onClick = { onOpenDocument(doc) },
                                 onToggleFavorite = {
                                     coroutineScope.launch {
@@ -350,6 +466,21 @@ fun LibraryScreen(
                                 onRename = {
                                     renameText = doc.title
                                     showRenameDialog = doc
+                                },
+                                onDuplicate = {
+                                    coroutineScope.launch {
+                                        val copy = repository.duplicateDocument(doc.id)
+                                        if (copy != null) {
+                                            Toast.makeText(context, "Duplicated \"${copy.title}\"", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                },
+                                onEditTags = {
+                                    tagsInputText = doc.tags.joinToString(", ")
+                                    showTagsDialog = doc
+                                },
+                                onMoveToFolder = {
+                                    showMoveFolderDialog = doc
                                 },
                                 onDelete = {
                                     coroutineScope.launch {
@@ -371,6 +502,67 @@ fun LibraryScreen(
                 }
             }
         }
+    }
+
+    // Create Folder Dialog
+    if (showCreateFolderDialog) {
+        var folderName by remember { mutableStateOf("") }
+        val folderColors = listOf(0xFF2563EB, 0xFF0D9488, 0xFF7C3AED, 0xFFDC2626, 0xFFD97706)
+        var selectedColor by remember { mutableLongStateOf(folderColors.first()) }
+
+        AlertDialog(
+            onDismissRequest = { showCreateFolderDialog = false },
+            title = { Text("Create New Folder") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = folderName,
+                        onValueChange = { folderName = it },
+                        label = { Text("Folder Name") },
+                        placeholder = { Text("e.g. Semester 1, Client Projects") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text("Folder Color:", style = MaterialTheme.typography.labelMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        folderColors.forEach { colorHex ->
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(colorHex.toULong()))
+                                    .border(
+                                        width = if (selectedColor == colorHex) 3.dp else 1.dp,
+                                        color = if (selectedColor == colorHex) MaterialTheme.colorScheme.onSurface else Color.Transparent,
+                                        shape = CircleShape
+                                    )
+                                    .clickable { selectedColor = colorHex }
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (folderName.isNotBlank()) {
+                            showCreateFolderDialog = false
+                            coroutineScope.launch {
+                                val folder = repository.createFolder(folderName, color = selectedColor)
+                                selectedFolderId = folder.id
+                            }
+                        }
+                    }
+                ) {
+                    Text("Create Folder")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateFolderDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     // Create Notebook Dialog
@@ -403,7 +595,7 @@ fun LibraryScreen(
                             FilterChip(
                                 selected = selectedTemplate == tmpl,
                                 onClick = { selectedTemplate = tmpl },
-                                label = { Text(tmpl.name.replace("_", " ").lowercase().capitalize(Locale.ROOT)) }
+                                label = { Text(tmpl.name.replace("_", " ").lowercase().replaceFirstChar { it.titlecase(Locale.ROOT) }) }
                             )
                         }
                     }
@@ -414,7 +606,7 @@ fun LibraryScreen(
                     onClick = {
                         showCreateNotebookDialog = false
                         coroutineScope.launch {
-                            val doc = repository.createNotebook(newTitle, selectedTemplate)
+                            val doc = repository.createNotebook(newTitle, selectedTemplate, folderId = selectedFolderId)
                             onOpenDocument(doc)
                         }
                     }
@@ -452,7 +644,7 @@ fun LibraryScreen(
                     onClick = {
                         showCreateWhiteboardDialog = false
                         coroutineScope.launch {
-                            val doc = repository.createWhiteboard(boardTitle)
+                            val doc = repository.createWhiteboard(boardTitle, folderId = selectedFolderId)
                             onOpenDocument(doc)
                         }
                     }
@@ -501,6 +693,106 @@ fun LibraryScreen(
         )
     }
 
+    // Edit Tags Dialog
+    showTagsDialog?.let { doc ->
+        AlertDialog(
+            onDismissRequest = { showTagsDialog = null },
+            title = { Text("Edit Document Tags") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Separate tags with commas (e.g. exam, calculus, important):",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = tagsInputText,
+                        onValueChange = { tagsInputText = it },
+                        placeholder = { Text("exam, lecture, review") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val parsedTags = tagsInputText
+                            .split(",")
+                            .map { it.trim().removePrefix("#") }
+                            .filter { it.isNotEmpty() }
+                            .distinct()
+                        showTagsDialog = null
+                        coroutineScope.launch {
+                            repository.updateDocumentTags(doc.id, parsedTags)
+                        }
+                    }
+                ) {
+                    Text("Save Tags")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTagsDialog = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Move to Folder Dialog
+    showMoveFolderDialog?.let { doc ->
+        AlertDialog(
+            onDismissRequest = { showMoveFolderDialog = null },
+            title = { Text("Move \"${doc.title}\" to Folder") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            showMoveFolderDialog = null
+                            coroutineScope.launch {
+                                repository.moveDocumentToFolder(doc.id, null)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("No Folder (Root Library)")
+                    }
+                    folders.forEach { folder ->
+                        Button(
+                            onClick = {
+                                showMoveFolderDialog = null
+                                coroutineScope.launch {
+                                    repository.moveDocumentToFolder(doc.id, folder.id)
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (doc.folderId == folder.id) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = if (doc.folderId == folder.id) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        ) {
+                            Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(folder.name)
+                        }
+                    }
+                    if (folders.isEmpty()) {
+                        Text(
+                            "No custom folders created yet. Use the 'Folder' button in the top bar to create one.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showMoveFolderDialog = null }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
     // Settings & Backup Dialog
     if (showSettingsDialog) {
         AlertDialog(
@@ -515,12 +807,12 @@ fun LibraryScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Text(
-                        text = "InkFlow Studio v1.0.0 (Native Offline)",
+                        text = "InkFlow Studio v2.0 Pro (Native Offline)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "Your data is stored 100% locally on this device in SQLite and sandboxed vector storage.",
+                        text = "Your notebooks, vector ink strokes, text annotations, cropped images, whiteboards, and SM-2 study cards are stored 100% locally in SQLite with SHA-256 verified backups.",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -529,14 +821,15 @@ fun LibraryScreen(
 
                     Text("Full Data Portability & Safety:", fontWeight = FontWeight.SemiBold)
 
-                    // Export Full Backup Button
+                    // Export Full Backup Button (with SAF file save)
                     Button(
                         onClick = {
                             coroutineScope.launch {
                                 try {
                                     val backupFile = backupManager?.createBackup()
                                     if (backupFile != null && backupFile.exists()) {
-                                        Toast.makeText(context, "Backup created: ${backupFile.name} (${backupFile.length() / 1024} KB)", Toast.LENGTH_LONG).show()
+                                        pendingBackupFile = backupFile
+                                        saveBackupLauncher.launch(backupFile.name)
                                     }
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Backup failed: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -577,9 +870,13 @@ fun LibraryScreen(
 @Composable
 fun DocumentCard(
     document: Document,
+    folderName: String? = null,
     onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
     onRename: () -> Unit,
+    onDuplicate: () -> Unit,
+    onEditTags: () -> Unit,
+    onMoveToFolder: () -> Unit,
     onDelete: () -> Unit,
     onRestore: () -> Unit
 ) {
@@ -614,24 +911,43 @@ fun DocumentCard(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(badgeColor.copy(alpha = 0.12f))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(
-                        imageVector = typeIcon,
-                        contentDescription = null,
-                        tint = badgeColor,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = typeLabel,
-                        color = badgeColor,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(badgeColor.copy(alpha = 0.12f))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Icon(
+                            imageVector = typeIcon,
+                            contentDescription = null,
+                            tint = badgeColor,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = typeLabel,
+                            color = badgeColor,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    if (folderName != null) {
+                        Text(
+                            text = folderName,
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                 }
 
                 // Favorite & Menu
@@ -693,6 +1009,31 @@ fun DocumentCard(
                                     }
                                 )
                                 DropdownMenuItem(
+                                    text = { Text("Duplicate") },
+                                    leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onDuplicate()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Edit Tags") },
+                                    leadingIcon = { Icon(Icons.Default.Label, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onEditTags()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Move to Folder") },
+                                    leadingIcon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        onMoveToFolder()
+                                    }
+                                )
+                                HorizontalDivider()
+                                DropdownMenuItem(
                                     text = { Text("Move to Trash", color = MaterialTheme.colorScheme.error) },
                                     leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                                     onClick = {
@@ -706,7 +1047,7 @@ fun DocumentCard(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
             // Document Title
             Text(
@@ -717,7 +1058,29 @@ fun DocumentCard(
                 overflow = TextOverflow.Ellipsis
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            // Tags Row
+            if (document.tags.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState())
+                ) {
+                    document.tags.forEach { tag ->
+                        Text(
+                            text = "#$tag",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             // Metadata: Page count & Date
             Row(
@@ -739,4 +1102,3 @@ fun DocumentCard(
         }
     }
 }
-

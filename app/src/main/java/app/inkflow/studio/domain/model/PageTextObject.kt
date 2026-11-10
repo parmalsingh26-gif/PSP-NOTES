@@ -8,6 +8,9 @@ data class PageTextObject(
     val text: String,
     val fontSizeSp: Float = 16f,
     val color: Long = 0xFF0F172A,
-    val backgroundColor: Long? = 0x80FEF08A // Translucent soft yellow
+    val backgroundColor: Long? = 0x80FEF08A, // Translucent soft yellow
+    val width: Float = 240f,
+    val isBold: Boolean = false,
+    val isItalic: Boolean = false,
+    val zIndex: Int = 0
 )
-

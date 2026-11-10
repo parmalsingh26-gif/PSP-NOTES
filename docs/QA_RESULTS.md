@@ -10,7 +10,6 @@
 - **Target SDK:** 35
 - **Build Status:** **SUCCESSFUL**
 - **Artifact Path:** `app/build/outputs/apk/debug/app-debug.apk`
-- **Artifact Size:** 17 MB
 
 ---
 
@@ -23,61 +22,50 @@ export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
 
 ### Results Summary
 - Total Test Classes: 8
-- Total Tests Run: **27**
-- Passed: **27**
+- Total Tests Run: **33**
+- Passed: **33**
 - Failed: **0**
 - Skipped: **0**
 
 ### Breakdown by Test Class
-1. **`InkEngineTest`** (6 tests):
-   - `testScreenToDocumentTransform`: **PASS**
-   - `testStrokeRecording`: **PASS**
-   - `testUndoRedo`: **PASS**
-   - `testStrokeEraser`: **PASS**
-   - `testHighlighterOpacity`: **PASS**
-   - `testStylusPalmRejectionPolicy`: **PASS**
-2. **`LassoSelectionTest`** (4 tests):
-   - `testLassoSelectsContainedStroke`: **PASS**
-   - `testLassoIgnoresOutsideStroke`: **PASS**
-   - `testMoveSelectedStrokes`: **PASS**
-   - `testDeleteSelectedStrokes`: **PASS**
-3. **`ShapeRecognizerTest`** (4 tests):
+1. **`InkEngineTest`** (8 tests):
+   - `testCoordinateTransform_normal`: **PASS**
+   - `testCoordinateTransform_withZoomAndPan`: **PASS**
+   - `testStrokeBoundingBoxCalculation`: **PASS**
+   - `testStrokeEraserIntersection_hit`: **PASS**
+   - `testStrokeEraserIntersection_miss`: **PASS**
+   - `testUndoRedo_stack`: **PASS**
+   - `testPixelEraser_splitsLongStrokeIntoSubStrokes`: **PASS**
+   - `testReplaceLastAddedStroke_autoShapeUndoRedo`: **PASS**
+2. **`LassoSelectionTest`** (2 comprehensive workflow tests):
+   - `testLassoSelectionAndMove`: **PASS**
+   - `testLassoScaleRecolorAndDuplicate`: **PASS**
+3. **`ShapeRecognizerTest`** (5 tests):
    - `testStraightLineRecognition`: **PASS**
    - `testCircleRecognition`: **PASS**
    - `testRectangleRecognition`: **PASS**
    - `testRandomSquiggleIsNotRecognized`: **PASS**
-4. **`ShapeFactoryTest`** (6 tests):
+   - `testTriangleRecognition`: **PASS**
+4. **`ShapeFactoryTest`** (7 tests):
    - `testCreateRectangle`: **PASS**
    - `testCreateCircle`: **PASS**
    - `testCreateLine`: **PASS**
    - `testCreateArrow`: **PASS**
    - `testCreateTriangle`: **PASS**
    - `testCreateStar`: **PASS**
+   - `testCreateDoubleArrowAndDiamondAndCoordinateAxes`: **PASS**
 5. **`PageImageTest`** (2 tests):
    - `testPageImageSerializationAndTransform`: **PASS**
    - `testPageImageLockAndDuplicate`: **PASS**
 6. **`StrokeSerializationTest`** (1 test):
    - `testStrokeSerializationAndDeserialization`: **PASS**
-7. **`SpacedRepetitionTest`** (2 tests):
+7. **`SpacedRepetitionTest`** (3 tests):
    - `testInitialReview`: **PASS**
    - `testConsecutiveSuccessfulReviews`: **PASS**
-8. **`LocalAiProviderTest`** (2 tests):
-   - `testGenerateSummary`: **PASS**
-   - `testGenerateFlashcards`: **PASS**
-
----
-
-## 3. Manual Device Testing Checklist
-- [x] Launch app on tablet / phone screen -> Library displays correctly with Hindi / English localization.
-- [x] Create new notebook -> Page canvas centers cleanly with no half-screen offset.
-- [x] Inking with Stylus / Finger -> Smooth vector stroke preview, zero lag, stroke committed on lift.
-- [x] Stylus-only mode toggle -> Palm rejection actively ignores accidental finger touches.
-- [x] Import multi-page PDF -> All $N$ pages extracted and browsable via page flip and bottom sheet grid.
-- [x] Inking on imported PDF -> Vector strokes draw cleanly above PDF page, stay anchored across zoom/pan.
-- [x] Multi-touch pinch-to-zoom & two-finger pan -> Canvas scales smoothly from 50% to 400% without creating stray strokes.
-- [x] Preset shapes tool -> Dragging on canvas shows dashed preview and generates exact shape (Rect, RoundRect, Circle, Line, Arrow, Triangle, Star).
-- [x] Freehand AutoShape -> Drawing rough circles, lines, or boxes snaps to clean vector primitives.
-- [x] Insert Image -> Select image from storage, position on page, drag to move, drag corner to resize, rotate 90°, flip, lock, duplicate, and delete.
-- [x] Page Manager -> View thumbnails, duplicate page, delete page, change template, toggle bookmark.
-- [x] Full Library Backup & Restore -> Export JSON archive with SHA-256 integrity, restore cleanly.
-- [x] PDF Export -> Generates PDF with background page, inserted images, text notes, and vector annotations.
+   - `testFailedReviewResetsInterval`: **PASS**
+8. **`LocalAiProviderTest`** (5 tests):
+   - `testGenerateSummary_normalText`: **PASS**
+   - `testGenerateSummary_emptyText`: **PASS**
+   - `testGenerateFlashcards_extractedDefinitions`: **PASS**
+   - `testAnswerQuestion_foundKeyword`: **PASS**
+   - `testAnalyzeHandwritingStructure_detectsLinesAndHighlights`: **PASS**

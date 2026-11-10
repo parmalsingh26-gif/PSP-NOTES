@@ -107,5 +107,49 @@ class InkEngineTest {
         assertEquals(1, redone.size)
         assertEquals(stroke1.id, redone[0].id)
     }
+
+    @Test
+    fun testPixelEraser_splitsLongStrokeIntoSubStrokes() {
+        val points = (0..10).map { i -> InkPoint(i * 10f, 50f, 1.0f) }
+        val stroke = InkStroke(
+            id = "long-stroke",
+            tool = ToolType.PEN,
+            color = 0xFF000000,
+            width = 3f,
+            points = points
+        )
+        // Erase in the middle at (50, 50) with radius 12 -> removes points at x=40, 50, 60
+        val result = inkEngine.erasePartialAt(50f, 50f, 12f, listOf(stroke))
+        // Should split into two separate sub-strokes: [0..30] and [70..100]
+        assertEquals(2, result.size)
+        assertEquals(0f, result[0].points.first().x, 0.01f)
+        assertEquals(100f, result[1].points.last().x, 0.01f)
+
+        // Undo should restore the single original stroke
+        val restored = inkEngine.undo(result)
+        assertEquals(1, restored.size)
+        assertEquals("long-stroke", restored[0].id)
+    }
+
+    @Test
+    fun testReplaceLastAddedStroke_autoShapeUndoRedo() {
+        inkEngine.startStroke(0f, 0f)
+        inkEngine.continueStroke(50f, 5f)
+        inkEngine.continueStroke(100f, 0f)
+        val rawStroke = inkEngine.finishStroke()!!
+        val snappedStroke = rawStroke.copy(
+            id = "snapped-line",
+            points = listOf(InkPoint(0f, 0f), InkPoint(100f, 0f))
+        )
+        inkEngine.replaceLastAddedStroke(snappedStroke)
+
+        val current = listOf(snappedStroke)
+        val undone = inkEngine.undo(current)
+        assertEquals(0, undone.size)
+
+        val redone = inkEngine.redo(undone)
+        assertEquals(1, redone.size)
+        assertEquals("snapped-line", redone[0].id)
+    }
 }
 

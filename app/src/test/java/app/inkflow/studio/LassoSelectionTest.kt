@@ -52,5 +52,33 @@ class LassoSelectionTest {
         assertEquals(1, remaining.size)
         assertEquals("outside-1", remaining[0].id)
     }
+
+    @Test
+    fun testLassoScaleRecolorAndDuplicate() {
+        val inkEngine = InkEngine()
+        val stroke = InkStroke(
+            id = "target-1",
+            tool = ToolType.PEN,
+            color = 0xFF000000,
+            width = 2f,
+            points = listOf(InkPoint(40f, 40f), InkPoint(60f, 60f))
+        )
+        val lasso = listOf(Pair(0f, 0f), Pair(100f, 0f), Pair(100f, 100f), Pair(0f, 100f))
+        inkEngine.selectWithLasso(lasso, listOf(stroke))
+
+        // Scale by 2.0x around selection center (50, 50) -> (40,40) becomes (30,30) and (60,60) becomes (70,70)
+        val scaled = inkEngine.scaleSelectedStrokes(2.0f, listOf(stroke))
+        assertEquals(30f, scaled[0].points[0].x, 0.5f)
+        assertEquals(70f, scaled[0].points[1].x, 0.5f)
+
+        // Recolor selection
+        val recolored = inkEngine.recolorSelectedStrokes(0xFFDC2626, scaled)
+        assertEquals(0xFFDC2626, recolored[0].color)
+
+        // Duplicate selection
+        val duplicated = inkEngine.duplicateSelectedStrokes(15f, 15f, recolored)
+        assertEquals(2, duplicated.size)
+        assertNotEquals(duplicated[0].id, duplicated[1].id)
+    }
 }
 

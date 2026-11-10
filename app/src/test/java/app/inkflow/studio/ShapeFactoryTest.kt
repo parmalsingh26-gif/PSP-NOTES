@@ -105,4 +105,36 @@ class ShapeFactoryTest {
         // 5 outer points + 5 inner points + 1 closing point = 11 points
         assertEquals(11, stroke.points.size)
     }
+
+    @Test
+    fun testCreateDoubleArrowAndDiamondAndCoordinateAxes() {
+        val doubleArrow = ShapeFactory.createPresetShape(
+            type = PresetShapeType.DOUBLE_ARROW,
+            startX = 0f,
+            startY = 0f,
+            endX = 200f,
+            endY = 0f
+        )
+        assertTrue(doubleArrow.points.size >= 8)
+
+        val diamond = ShapeFactory.createPresetShape(
+            type = PresetShapeType.DIAMOND,
+            startX = 0f,
+            startY = 0f,
+            endX = 100f,
+            endY = 100f
+        )
+        assertEquals(5, diamond.points.size)
+        assertEquals(50f, diamond.points[0].x, 0.01f)
+        assertEquals(0f, diamond.points[0].y, 0.01f)
+
+        val axes = ShapeFactory.createPresetShape(
+            type = PresetShapeType.COORDINATE_AXES,
+            startX = 10f,
+            startY = 10f,
+            endX = 210f,
+            endY = 210f
+        )
+        assertTrue(axes.points.size >= 7)
+    }
 }

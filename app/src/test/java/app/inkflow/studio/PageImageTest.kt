@@ -77,3 +77,4 @@ class PageImageTest {
         assertEquals(original.width, duplicate.width, 0.01f)
     }
 }
+

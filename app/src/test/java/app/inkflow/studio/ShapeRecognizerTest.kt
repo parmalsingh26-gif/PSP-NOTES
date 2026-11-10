@@ -118,5 +118,29 @@ class ShapeRecognizerTest {
         val result = ShapeRecognizer.recognize(stroke)
         assertEquals(RecognizedShapeType.NONE, result.type)
     }
+
+    @Test
+    fun testTriangleRecognition() {
+        // Points along a triangle with vertices (100, 20), (180, 160), (20, 160)
+        val points = listOf(
+            InkPoint(100f, 20f),
+            InkPoint(140f, 90f),
+            InkPoint(180f, 160f),
+            InkPoint(100f, 160f),
+            InkPoint(20f, 160f),
+            InkPoint(60f, 90f),
+            InkPoint(100f, 20f)
+        )
+        val stroke = InkStroke(
+            id = "test-triangle",
+            tool = ToolType.PEN,
+            color = 0xFF000000,
+            width = 2f,
+            points = points
+        )
+        val result = ShapeRecognizer.recognize(stroke)
+        assertEquals(RecognizedShapeType.TRIANGLE, result.type)
+        assertEquals(4, result.snappedStroke.points.size)
+    }
 }
 

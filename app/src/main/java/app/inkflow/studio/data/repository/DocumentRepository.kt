@@ -186,6 +186,60 @@ class DocumentRepository(
         documentDao.rename(id, newTitle)
     }
 
+    suspend fun updateDocumentTags(id: String, tags: List<String>) = withContext(Dispatchers.IO) {
+        val doc = documentDao.getDocumentById(id) ?: return@withContext
+        val cleanTags = tags.map { it.trim() }.filter { it.isNotBlank() }.distinct().joinToString(",")
+        documentDao.update(doc.copy(tags = cleanTags, updatedAt = System.currentTimeMillis()))
+    }
+
+    suspend fun moveDocumentToFolder(id: String, folderId: String?) = withContext(Dispatchers.IO) {
+        val doc = documentDao.getDocumentById(id) ?: return@withContext
+        documentDao.update(doc.copy(folderId = folderId, updatedAt = System.currentTimeMillis()))
+    }
+
+    suspend fun duplicateDocument(id: String): Document? = withContext(Dispatchers.IO) {
+        val originalDoc = documentDao.getDocumentById(id) ?: return@withContext null
+        val newDocId = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val duplicatedDocEntity = originalDoc.copy(
+            id = newDocId,
+            title = "${originalDoc.title} (Copy)",
+            createdAt = now,
+            updatedAt = now,
+            isFavorite = false,
+            isTrashed = false,
+            trashedAt = null
+        )
+        documentDao.insertOrUpdate(duplicatedDocEntity)
+
+        val originalPages = pageDao.getPagesForDocumentSync(id)
+        for (p in originalPages) {
+            val newPageId = UUID.randomUUID().toString()
+            val newPageEntity = p.copy(id = newPageId, documentId = newDocId)
+            pageDao.insertOrUpdate(newPageEntity)
+
+            val strokes = strokeFileStore.loadPageStrokes(p.id).map { it.copy(id = UUID.randomUUID().toString()) }
+            if (strokes.isNotEmpty()) strokeFileStore.savePageStrokes(newPageId, strokes)
+
+            val texts = strokeFileStore.loadPageTexts(p.id).map { it.copy(id = UUID.randomUUID().toString(), pageId = newPageId) }
+            if (texts.isNotEmpty()) strokeFileStore.savePageTexts(newPageId, texts)
+
+            val images = strokeFileStore.loadPageImages(p.id).map { it.copy(id = UUID.randomUUID().toString(), pageId = newPageId) }
+            if (images.isNotEmpty()) strokeFileStore.savePageImages(newPageId, images)
+        }
+
+        val wbObjects = strokeFileStore.loadWhiteboardObjects(id).map { it.copy(id = UUID.randomUUID().toString()) }
+        if (wbObjects.isNotEmpty()) {
+            strokeFileStore.saveWhiteboardObjects(newDocId, wbObjects)
+        }
+        val wbStrokes = strokeFileStore.loadPageStrokes("wb_$id").map { it.copy(id = UUID.randomUUID().toString()) }
+        if (wbStrokes.isNotEmpty()) {
+            strokeFileStore.savePageStrokes("wb_$newDocId", wbStrokes)
+        }
+
+        duplicatedDocEntity.toDomain()
+    }
+
     suspend fun setFavorite(id: String, isFavorite: Boolean) = withContext(Dispatchers.IO) {
         documentDao.setFavorite(id, isFavorite)
     }
@@ -203,13 +257,13 @@ class DocumentRepository(
         for (p in pages) {
             strokeFileStore.deletePageStrokes(p.id)
         }
+        strokeFileStore.deletePageStrokes("wb_$id")
         pageDao.deleteAllPagesForDocument(id)
         pdfFileStore.deletePdf(id)
         documentDao.permanentDelete(id)
     }
 
     suspend fun emptyTrash() = withContext(Dispatchers.IO) {
-        // Collect all trashed docs
         documentDao.emptyTrash()
     }
 
@@ -272,6 +326,8 @@ class DocumentRepository(
     suspend fun duplicatePage(pageId: String, documentId: String): Page? = withContext(Dispatchers.IO) {
         val originalEntity = pageDao.getPageById(pageId) ?: return@withContext null
         val originalStrokes = strokeFileStore.loadPageStrokes(pageId)
+        val originalTexts = strokeFileStore.loadPageTexts(pageId)
+        val originalImages = strokeFileStore.loadPageImages(pageId)
 
         val newPageId = UUID.randomUUID().toString()
         val currentCount = pageDao.getPageCount(documentId)
@@ -288,6 +344,16 @@ class DocumentRepository(
 
         val duplicatedStrokes = originalStrokes.map { it.copy(id = UUID.randomUUID().toString()) }
         strokeFileStore.savePageStrokes(newPageId, duplicatedStrokes)
+
+        if (originalTexts.isNotEmpty()) {
+            val duplicatedTexts = originalTexts.map { it.copy(id = UUID.randomUUID().toString(), pageId = newPageId) }
+            strokeFileStore.savePageTexts(newPageId, duplicatedTexts)
+        }
+
+        if (originalImages.isNotEmpty()) {
+            val duplicatedImages = originalImages.map { it.copy(id = UUID.randomUUID().toString(), pageId = newPageId) }
+            strokeFileStore.savePageImages(newPageId, duplicatedImages)
+        }
 
         documentDao.getDocumentById(documentId)?.let { doc ->
             documentDao.update(doc.copy(pageCount = currentCount + 1, updatedAt = System.currentTimeMillis()))
@@ -340,11 +406,12 @@ class DocumentRepository(
     fun getAllFolders(): Flow<List<Folder>> =
         folderDao.getAllFolders().map { list -> list.map { it.toDomain() } }
 
-    suspend fun createFolder(name: String, parentId: String? = null): Folder = withContext(Dispatchers.IO) {
+    suspend fun createFolder(name: String, parentId: String? = null, color: Long = 0xFF2563EB): Folder = withContext(Dispatchers.IO) {
         val folder = Folder(
             id = UUID.randomUUID().toString(),
             parentId = parentId,
-            name = name.ifBlank { "New Folder" }
+            name = name.ifBlank { "New Folder" },
+            color = color
         )
         folderDao.insertOrUpdate(FolderEntity.fromDomain(folder))
         folder

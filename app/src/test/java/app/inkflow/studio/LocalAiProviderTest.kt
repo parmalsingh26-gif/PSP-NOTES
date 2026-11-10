@@ -61,5 +61,34 @@ class LocalAiProviderTest {
         assertNotNull(ans)
         assertTrue(ans!!.contains("300000 kilometers"))
     }
+
+    @Test
+    fun testAnalyzeHandwritingStructure_detectsLinesAndHighlights() {
+        val strokes = listOf(
+            app.inkflow.studio.domain.model.InkStroke(
+                id = "s1",
+                tool = app.inkflow.studio.domain.model.ToolType.PEN,
+                color = 0xFF000000,
+                width = 3f,
+                points = listOf(
+                    app.inkflow.studio.domain.model.InkPoint(50f, 100f),
+                    app.inkflow.studio.domain.model.InkPoint(200f, 102f)
+                )
+            ),
+            app.inkflow.studio.domain.model.InkStroke(
+                id = "s2",
+                tool = app.inkflow.studio.domain.model.ToolType.HIGHLIGHTER,
+                color = 0xFFFACC15,
+                width = 16f,
+                points = listOf(
+                    app.inkflow.studio.domain.model.InkPoint(50f, 100f),
+                    app.inkflow.studio.domain.model.InkPoint(200f, 100f)
+                )
+            )
+        )
+        val analysis = aiProvider.analyzeHandwritingStructure(strokes, pageNumber = 1)
+        assertTrue(analysis.contains("[Page 1 Visual Layout]"))
+        assertTrue(analysis.contains("1 highlighted passage"))
+    }
 }
 
