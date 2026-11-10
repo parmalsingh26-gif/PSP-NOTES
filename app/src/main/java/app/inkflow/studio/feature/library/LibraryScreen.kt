@@ -101,18 +101,23 @@ fun LibraryScreen(
         }
     }
 
-    // PDF Picker Launcher
+    // PDF Picker Launcher with safe error handling
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
             val extractedTitle = resolvePdfTitle(it)
             coroutineScope.launch {
-                val doc = repository.createPdfDocument(
-                    title = extractedTitle,
-                    uri = it
-                )
-                onOpenDocument(doc)
+                try {
+                    val doc = repository.createPdfDocument(
+                        title = extractedTitle,
+                        uri = it
+                    )
+                    onOpenDocument(doc)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    Toast.makeText(context, "Could not import PDF: ${e.localizedMessage ?: "Invalid file"}", Toast.LENGTH_LONG).show()
+                }
             }
         }
     }
@@ -220,6 +225,12 @@ fun LibraryScreen(
                 label = { Text("Library", fontSize = 11.sp) }
             )
             NavigationRailItem(
+                selected = selectedFilter == LibraryFilter.PDFS,
+                onClick = { selectedFilter = LibraryFilter.PDFS },
+                icon = { Icon(Icons.Outlined.PictureAsPdf, contentDescription = "PDFs") },
+                label = { Text("PDFs", fontSize = 11.sp) }
+            )
+            NavigationRailItem(
                 selected = selectedFilter == LibraryFilter.FAVORITES,
                 onClick = { selectedFilter = LibraryFilter.FAVORITES },
                 icon = { Icon(Icons.Outlined.Star, contentDescription = "Favorites") },
@@ -292,7 +303,14 @@ fun LibraryScreen(
                             }
 
                             OutlinedButton(
-                                onClick = { pdfPickerLauncher.launch(arrayOf("application/pdf")) },
+                                onClick = {
+                                    try {
+                                        pdfPickerLauncher.launch(arrayOf("application/pdf"))
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                        Toast.makeText(context, "No PDF picker available on device", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -436,7 +454,22 @@ fun LibraryScreen(
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            if (selectedFilter != LibraryFilter.TRASH) {
+                            if (selectedFilter == LibraryFilter.PDFS) {
+                                Button(
+                                    onClick = {
+                                        try {
+                                            pdfPickerLauncher.launch(arrayOf("application/pdf"))
+                                        } catch (e: Exception) {
+                                            Toast.makeText(context, "No PDF picker available", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Import Your First PDF")
+                                }
+                            } else if (selectedFilter != LibraryFilter.TRASH) {
                                 Button(
                                     onClick = { showCreateNotebookDialog = true },
                                     shape = RoundedCornerShape(10.dp)

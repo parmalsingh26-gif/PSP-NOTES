@@ -394,6 +394,23 @@ class DocumentRepository(
         duplicatedPage.toDomain().copy(strokes = duplicatedStrokes)
     }
 
+    /**
+     * Reorders a page from [fromIndex] to [toIndex] (0-based) and updates all intervening page indices sequentially.
+     */
+    suspend fun movePage(documentId: String, fromIndex: Int, toIndex: Int): Boolean = withContext(Dispatchers.IO) {
+        val allPages = pageDao.getPagesForDocumentSync(documentId).toMutableList()
+        if (fromIndex !in allPages.indices || toIndex !in allPages.indices || fromIndex == toIndex) {
+            return@withContext false
+        }
+        val movedPage = allPages.removeAt(fromIndex)
+        allPages.add(toIndex, movedPage)
+
+        for ((idx, page) in allPages.withIndex()) {
+            pageDao.insertOrUpdate(page.copy(pageIndex = idx))
+        }
+        true
+    }
+
     // --- Vector Strokes and Objects ---
     suspend fun savePageStrokes(pageId: String, strokes: List<InkStroke>) = withContext(Dispatchers.IO) {
         strokeFileStore.savePageStrokes(pageId, strokes)

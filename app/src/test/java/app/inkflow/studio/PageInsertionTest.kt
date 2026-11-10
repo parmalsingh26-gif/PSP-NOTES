@@ -91,3 +91,4 @@ class PageInsertionTest {
         assertEquals(7, templates.size)
     }
 }
+

@@ -257,6 +257,9 @@ fun NotebookEditorScreen(
                     val savedPath = repository.copyImageFromUri(it)
                     val targetPage = currentPage ?: return@launch
                     val bmp = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(savedPath) }
+                    if (bmp != null) {
+                        imageBitmaps[savedPath] = bmp
+                    }
                     val aspect = if (bmp != null && bmp.height > 0) bmp.width.toFloat() / bmp.height.toFloat() else 1f
                     val initW = 240f
                     val initH = (initW / aspect).coerceIn(80f, 360f)
@@ -350,6 +353,12 @@ fun NotebookEditorScreen(
         }
     }
 
+    DisposableEffect(pdfRenderer) {
+        onDispose {
+            pdfRenderer?.close()
+        }
+    }
+
     // Track previous page id so we can save before switching
     var previousPageId by remember { mutableStateOf<String?>(null) }
 
@@ -376,20 +385,21 @@ fun NotebookEditorScreen(
         selectedTextId = null
     }
 
-    // Decode bitmaps for any newly loaded images
+    // Decode bitmaps for any newly loaded images safely on IO and commit to state on Main thread
     LaunchedEffect(pageImages) {
-        withContext(Dispatchers.IO) {
-            for (img in pageImages) {
+        val loaded = withContext(Dispatchers.IO) {
+            pageImages.mapNotNull { img ->
                 if (!imageBitmaps.containsKey(img.filePath)) {
                     val f = File(img.filePath)
                     if (f.exists()) {
                         val bmp = BitmapFactory.decodeFile(f.absolutePath)
-                        if (bmp != null) {
-                            imageBitmaps[img.filePath] = bmp
-                        }
-                    }
-                }
+                        if (bmp != null) img.filePath to bmp else null
+                    } else null
+                } else null
             }
+        }
+        for ((path, bmp) in loaded) {
+            imageBitmaps[path] = bmp
         }
     }
 
@@ -1514,6 +1524,51 @@ fun NotebookEditorScreen(
                     }
                 }
 
+                // --- FLOATING READING GUIDE CONTROL BAR (when Reading Guide is active) ---
+                if (showReadingGuide) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(end = 16.dp, top = 16.dp)
+                            .shadow(6.dp, RoundedCornerShape(14.dp)),
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, Color(0xFFDC2626).copy(alpha = 0.6f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFDC2626))
+                            )
+                            Text("Reading Guide", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFDC2626))
+                            IconButton(
+                                onClick = { readingGuideY = (readingGuideY - 26f).coerceAtLeast(10f) },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Prev Line", modifier = Modifier.size(18.dp))
+                            }
+                            IconButton(
+                                onClick = { readingGuideY = (readingGuideY + 26f).coerceAtMost(pageH - 10f) },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Next Line", modifier = Modifier.size(18.dp))
+                            }
+                            IconButton(
+                                onClick = { showReadingGuide = false },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Close Reading Guide", modifier = Modifier.size(16.dp))
+                            }
+                        }
+                    }
+                }
+
                 // --- FLOATING IMAGE CONTEXTUAL TOOLBAR ---
                 selectedImage?.let { img ->
                     Surface(
@@ -2015,16 +2070,27 @@ fun NotebookEditorScreen(
                             )
                         }
 
-                        // Insert Image Button
-                        IconButton(
-                            onClick = { imagePickerLauncher.launch("image/*") },
-                            modifier = Modifier.clip(CircleShape)
+                        // Insert Image Button with clear label
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(16.dp))
+                                .clickable { imagePickerLauncher.launch("image/*") }
+                                .padding(horizontal = 4.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = "Insert Image",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AddPhotoAlternate,
+                                    contentDescription = "Insert Image",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text("Add Image", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                            }
                         }
 
                         // Insert Text Button
