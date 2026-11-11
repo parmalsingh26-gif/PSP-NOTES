@@ -8,6 +8,6 @@ data class Page(
     val height: Float = 842f, // Standard A4 point height
     val template: PageTemplate = PageTemplate.RULED,
     val isBookmarked: Boolean = false,
-    val strokes: List<InkStroke> = emptyList()
+    val strokes: List<InkStroke> = emptyList(),
+    val pdfPageIndex: Int? = null
 )
-

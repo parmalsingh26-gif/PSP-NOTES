@@ -90,53 +90,49 @@ class DocumentRepository(
         val file = File(savedPath)
         val now = System.currentTimeMillis()
 
+        if (!file.exists() || file.length() == 0L) {
+            file.delete()
+            throw IllegalArgumentException("The selected PDF file is empty or could not be read.")
+        }
+
         var actualPageCount = 1
         val pages = mutableListOf<PageEntity>()
 
         try {
-            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            if (pfd != null) {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
                 val renderer = PdfRenderer(pfd)
-                actualPageCount = renderer.pageCount.coerceAtLeast(1)
+                try {
+                    actualPageCount = renderer.pageCount
+                    if (actualPageCount <= 0) {
+                        throw IllegalArgumentException("The selected PDF contains no readable pages.")
+                    }
 
-                for (idx in 0 until actualPageCount) {
-                    val pdfPage = renderer.openPage(idx)
-                    val w = pdfPage.width.toFloat()
-                    val h = pdfPage.height.toFloat()
-                    pdfPage.close()
+                    for (idx in 0 until actualPageCount) {
+                        val pdfPage = renderer.openPage(idx)
+                        val w = pdfPage.width.toFloat()
+                        val h = pdfPage.height.toFloat()
+                        pdfPage.close()
 
-                    pages.add(
-                        PageEntity(
-                            id = UUID.randomUUID().toString(),
-                            documentId = docId,
-                            pageIndex = idx,
-                            width = if (w > 0f) w else 595f,
-                            height = if (h > 0f) h else 842f,
-                            template = PageTemplate.BLANK.name,
-                            isBookmarked = false
+                        pages.add(
+                            PageEntity(
+                                id = UUID.randomUUID().toString(),
+                                documentId = docId,
+                                pageIndex = idx,
+                                width = if (w > 0f) w else 595f,
+                                height = if (h > 0f) h else 842f,
+                                template = PageTemplate.BLANK.name,
+                                isBookmarked = false,
+                                pdfPageIndex = idx
+                            )
                         )
-                    )
+                    }
+                } finally {
+                    renderer.close()
                 }
-                renderer.close()
-                pfd.close()
-            }
+            } ?: throw IllegalStateException("Could not open file descriptor for PDF.")
         } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        // Fallback for empty list
-        if (pages.isEmpty()) {
-            pages.add(
-                PageEntity(
-                    id = UUID.randomUUID().toString(),
-                    documentId = docId,
-                    pageIndex = 0,
-                    width = 595f,
-                    height = 842f,
-                    template = PageTemplate.BLANK.name,
-                    isBookmarked = false
-                )
-            )
+            file.delete()
+            throw IllegalArgumentException("Could not import PDF: ${e.localizedMessage ?: "Invalid or unsupported PDF"}", e)
         }
 
         val doc = Document(
@@ -370,7 +366,8 @@ class DocumentRepository(
             width = originalEntity.width,
             height = originalEntity.height,
             template = originalEntity.template,
-            isBookmarked = false
+            isBookmarked = false,
+            pdfPageIndex = originalEntity.pdfPageIndex
         )
         pageDao.insertOrUpdate(duplicatedPage)
 

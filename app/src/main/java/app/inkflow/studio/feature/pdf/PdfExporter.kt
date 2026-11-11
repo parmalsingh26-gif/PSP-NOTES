@@ -53,8 +53,9 @@ class PdfExporter {
                 val canvas = pdfPage.canvas
 
                 // 1. Draw Background (PDF page or Notebook Paper Template)
-                if (pdfRenderer != null && page.index < pdfRenderer.pageCount) {
-                    val renderedBitmap = pdfRenderer.renderPage(page.index, pageWidth, pageHeight)
+                val targetPdfIndex = page.pdfPageIndex
+                if (pdfRenderer != null && targetPdfIndex != null && targetPdfIndex < pdfRenderer.pageCount) {
+                    val renderedBitmap = pdfRenderer.renderPage(targetPdfIndex, pageWidth, pageHeight)
                     if (renderedBitmap != null) {
                         canvas.drawBitmap(renderedBitmap, 0f, 0f, null)
                     }

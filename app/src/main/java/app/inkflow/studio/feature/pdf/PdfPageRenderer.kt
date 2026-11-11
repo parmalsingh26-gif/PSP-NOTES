@@ -46,7 +46,7 @@ class PdfPageRenderer(private val pdfFile: File) {
     val pageCount: Int
         get() = pdfRenderer?.pageCount ?: 0
 
-    suspend fun renderPage(pageIndex: Int, targetWidth: Int = 1190, targetHeight: Int = 1684): Bitmap? =
+    suspend fun renderPage(pageIndex: Int, targetWidth: Int = 1080, targetHeight: Int = 1528): Bitmap? =
         withContext(Dispatchers.IO) {
             bitmapCache.get(pageIndex)?.let { return@withContext it }
 
@@ -67,20 +67,27 @@ class PdfPageRenderer(private val pdfFile: File) {
                     val pWidth = page.width.coerceAtLeast(1)
                     val pHeight = page.height.coerceAtLeast(1)
                     val aspect = pWidth.toFloat() / pHeight.toFloat()
-                    val outW = targetWidth.coerceIn(400, 2400)
-                    val outH = (outW / aspect).roundToInt().coerceIn(400, 3400)
+                    val outW = targetWidth.coerceIn(400, 1920)
+                    val outH = (outW / aspect).roundToInt().coerceIn(400, 2800)
 
-                    val bitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+                    val bitmap = try {
+                        Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+                    } catch (oom: OutOfMemoryError) {
+                        bitmapCache.evictAll()
+                        System.gc()
+                        // Fallback to half resolution to conserve memory
+                        Bitmap.createBitmap((outW / 2).coerceAtLeast(300), (outH / 2).coerceAtLeast(400), Bitmap.Config.RGB_565)
+                    }
+
                     bitmap.eraseColor(Color.WHITE)
-
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                     page.close()
                     page = null
 
                     bitmapCache.put(pageIndex, bitmap)
                     bitmap
-                } catch (e: Exception) {
-                    e.printStackTrace()
+                } catch (t: Throwable) {
+                    t.printStackTrace()
                     page?.close()
                     null
                 }

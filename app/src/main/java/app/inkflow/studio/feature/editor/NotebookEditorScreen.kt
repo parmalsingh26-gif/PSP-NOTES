@@ -163,6 +163,15 @@ fun NotebookEditorScreen(
     var isDraggingRuler by remember { mutableStateOf(false) }
     var rulerDragStart by remember { mutableStateOf<Pair<Float, Float>?>(null) }
 
+    // Fit Width View Mode (Fits PDF page to device width for reading without side margins)
+    var isFitWidth by remember { mutableStateOf(document?.type == DocumentType.PDF) }
+
+    // Touch gesture tracking for click vs draw detection
+    var touchDownDocX by remember { mutableFloatStateOf(0f) }
+    var touchDownDocY by remember { mutableFloatStateOf(0f) }
+    var touchDownTime by remember { mutableLongStateOf(0L) }
+    var potentialTappedImageId by remember { mutableStateOf<String?>(null) }
+
     // PDF Reading Guide (Red Line Overlay)
     var showReadingGuide by remember { mutableStateOf(false) }
     var readingGuideY by remember { mutableFloatStateOf(300f) }
@@ -184,6 +193,26 @@ fun NotebookEditorScreen(
     var showImageCropDialog by remember { mutableStateOf(false) }
     var lastImageTapTime by remember { mutableLongStateOf(0L) }
     var lastTappedImageId by remember { mutableStateOf<String?>(null) }
+
+    // Safe Page Switch Helper: flushes current page state to disk before index change
+    fun navigateToPage(targetIndex: Int) {
+        if (targetIndex < 0 || targetIndex >= pages.size) return
+        val currentP = currentPage
+        if (currentP != null) {
+            val sSnap = currentStrokes
+            val tSnap = pageTexts
+            val iSnap = pageImages
+            coroutineScope.launch {
+                repository.savePageStrokes(currentP.id, sSnap)
+                repository.savePageTexts(currentP.id, tSnap)
+                repository.savePageImages(currentP.id, iSnap)
+            }
+        }
+        currentPageIndex = targetIndex
+        coroutineScope.launch {
+            repository.updateLastOpenedPage(documentId, targetIndex)
+        }
+    }
 
     // Text Manipulation State
     var selectedTextId by remember { mutableStateOf<String?>(null) }
@@ -385,6 +414,22 @@ fun NotebookEditorScreen(
         selectedTextId = null
     }
 
+    // Flush current page on exit
+    DisposableEffect(currentPage?.id) {
+        onDispose {
+            currentPage?.id?.let { pid ->
+                val s = currentStrokes
+                val t = pageTexts
+                val i = pageImages
+                coroutineScope.launch {
+                    repository.savePageStrokes(pid, s)
+                    repository.savePageTexts(pid, t)
+                    repository.savePageImages(pid, i)
+                }
+            }
+        }
+    }
+
     // Decode bitmaps for any newly loaded images safely on IO and commit to state on Main thread
     LaunchedEffect(pageImages) {
         val loaded = withContext(Dispatchers.IO) {
@@ -408,25 +453,32 @@ fun NotebookEditorScreen(
     val pdfBitmaps = remember { mutableStateMapOf<Int, Bitmap>() }
 
     // Render PDF page bitmap whenever currentPageIndex, pdfRenderer, or isContinuousVerticalScroll changes
-    LaunchedEffect(currentPageIndex, pdfRenderer, isContinuousVerticalScroll) {
+    LaunchedEffect(currentPageIndex, pdfRenderer, isContinuousVerticalScroll, currentPage?.pdfPageIndex) {
         pdfRenderer?.let { renderer ->
             val pCount = renderer.pageCount
+            if (pCount <= 0) return@LaunchedEffect
+
+            val currentPdfIdx = currentPage?.pdfPageIndex
             val pagesToLoad = if (isContinuousVerticalScroll && pCount > 1) {
-                ((currentPageIndex - 1).coerceAtLeast(0)..(currentPageIndex + 2).coerceAtMost(pCount - 1)).toList()
+                pages.filter { it.pdfPageIndex != null && abs(it.index - currentPageIndex) <= 2 }
+                    .mapNotNull { it.pdfPageIndex }
             } else {
-                listOf(currentPageIndex)
+                listOfNotNull(currentPdfIdx)
             }
+
+            // Evict distant bitmaps from Compose state to prevent heap exhaustion
+            val activePdfIdx = currentPdfIdx ?: 0
+            pdfBitmaps.keys.filter { abs(it - activePdfIdx) > 3 }.forEach { pdfBitmaps.remove(it) }
+
             for (idx in pagesToLoad) {
                 if (!pdfBitmaps.containsKey(idx)) {
                     val bmp = renderer.renderPage(idx)
                     if (bmp != null) {
                         pdfBitmaps[idx] = bmp
-                        if (idx == currentPageIndex) pdfBitmap = bmp
                     }
-                } else if (idx == currentPageIndex) {
-                    pdfBitmap = pdfBitmaps[idx]
                 }
             }
+            pdfBitmap = currentPdfIdx?.let { pdfBitmaps[it] }
         }
     }
 
@@ -485,7 +537,19 @@ fun NotebookEditorScreen(
                     ) {
                         // Left: Back & Title
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = onNavigateBack) {
+                            IconButton(onClick = {
+                                currentPage?.id?.let { pid ->
+                                    val s = currentStrokes
+                                    val t = pageTexts
+                                    val i = pageImages
+                                    coroutineScope.launch {
+                                        repository.savePageStrokes(pid, s)
+                                        repository.savePageTexts(pid, t)
+                                        repository.savePageImages(pid, i)
+                                    }
+                                }
+                                onNavigateBack()
+                            }) {
                                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                             }
                             Spacer(modifier = Modifier.width(8.dp))
@@ -550,10 +614,7 @@ fun NotebookEditorScreen(
 
                             IconButton(
                                 enabled = currentPageIndex > 0,
-                                onClick = {
-                                    currentPageIndex -= 1
-                                    coroutineScope.launch { repository.updateLastOpenedPage(documentId, currentPageIndex) }
-                                }
+                                onClick = { navigateToPage(currentPageIndex - 1) }
                             ) {
                                 Icon(Icons.Default.ChevronLeft, contentDescription = "Previous Page")
                             }
@@ -579,12 +640,28 @@ fun NotebookEditorScreen(
 
                             IconButton(
                                 enabled = currentPageIndex < pages.size - 1,
-                                onClick = {
-                                    currentPageIndex += 1
-                                    coroutineScope.launch { repository.updateLastOpenedPage(documentId, currentPageIndex) }
-                                }
+                                onClick = { navigateToPage(currentPageIndex + 1) }
                             ) {
                                 Icon(Icons.Default.ChevronRight, contentDescription = "Next Page")
+                            }
+
+                            // View Mode: Fit Width vs Fit Page
+                            IconButton(
+                                onClick = {
+                                    isFitWidth = !isFitWidth
+                                    panOffset = Offset.Zero
+                                    zoomScale = 1.0f
+                                    Toast.makeText(context, if (isFitWidth) "Fit Width" else "Fit Whole Page", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (isFitWidth) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                            ) {
+                                Icon(
+                                    imageVector = if (isFitWidth) Icons.Default.FitScreen else Icons.Default.ZoomOutMap,
+                                    contentDescription = "Fit Width / Page",
+                                    tint = if (isFitWidth) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
 
                             // Scroll Mode Toggle: Single Page Flip vs Continuous Vertical Scroll
@@ -643,7 +720,7 @@ fun NotebookEditorScreen(
                                     .background(if (showReadingGuide) Color(0x22DC2626) else Color.Transparent)
                             ) {
                                 Icon(
-                                    Icons.Default.Menu,
+                                    Icons.Default.HorizontalRule,
                                     contentDescription = "Toggle Reading Guide",
                                     tint = if (showReadingGuide) Color(0xFFDC2626) else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -681,11 +758,11 @@ fun NotebookEditorScreen(
                 val margin = 24f
                 val fitScaleX = (availableW - margin * 2) / pageW
                 val fitScaleY = (availableH - margin * 2) / pageH
-                val fitScale = min(fitScaleX, fitScaleY).coerceAtLeast(0.1f)
+                val baseScale = if (isFitWidth) fitScaleX.coerceIn(0.2f, 3.5f) else min(fitScaleX, fitScaleY).coerceAtLeast(0.1f)
 
-                val totalScale = fitScale * zoomScale
+                val totalScale = baseScale * zoomScale
 
-                val originX = (availableW - pageW * totalScale) / 2f
+                val originX = if (isFitWidth) margin else (availableW - pageW * totalScale) / 2f
                 val originY = (availableH - pageH * totalScale) / 2f
 
                 Box(
@@ -866,10 +943,16 @@ fun NotebookEditorScreen(
                                         }
                                     }
 
-                                    // E. Tap to select an Image or Text Object (Single-tap in PAN/LASSO/TEXT, or Double-tap in ANY mode)
+                                    // Track touch down for tap gesture recognition
+                                    touchDownDocX = rawDocX
+                                    touchDownDocY = rawDocY
+                                    touchDownTime = System.currentTimeMillis()
+
+                                    // E. Tap to select an Image or Text Object
                                     val tappedImg = pageImages.sortedBy { it.zIndex }.lastOrNull { img ->
                                         rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
                                     }
+                                    potentialTappedImageId = tappedImg?.id
                                     val now = System.currentTimeMillis()
                                     val isImageDoubleTap = (tappedImg != null && tappedImg.id == lastTappedImageId && (now - lastImageTapTime) < 400L)
                                     if (tappedImg != null) {
@@ -1125,6 +1208,31 @@ fun NotebookEditorScreen(
                                         return@pointerInteropFilter true
                                     }
 
+                                    // Detect Tap / Click gesture
+                                    val travelDist = hypot(rawDocX - touchDownDocX, rawDocY - touchDownDocY)
+                                    val isTap = travelDist < 14f && (System.currentTimeMillis() - touchDownTime) < 400L
+
+                                    // Re-select image on single tap (works in ANY tool mode, cancels accidental micro-stroke)
+                                    if (isTap && potentialTappedImageId != null) {
+                                        inkEngine.cancelStroke()
+                                        activeStrokeState = null
+                                        selectedImageId = potentialTappedImageId
+                                        selectedTextId = null
+                                        potentialTappedImageId = null
+                                        return@pointerInteropFilter true
+                                    }
+                                    potentialTappedImageId = null
+
+                                    // Deselect image/text if tapped on blank canvas
+                                    if (isTap && effectiveTool != ToolType.TEXT) {
+                                        val clickedOnImg = pageImages.any { img ->
+                                            rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
+                                        }
+                                        if (!clickedOnImg && selectedImageId != null) {
+                                            selectedImageId = null
+                                        }
+                                    }
+
                                     when (effectiveTool) {
                                         ToolType.ERASER_STROKE, ToolType.ERASER_PIXEL -> {
                                             coroutineScope.launch {
@@ -1216,13 +1324,16 @@ fun NotebookEditorScreen(
                         )
 
                         // 2. PDF Background or Paper Template
-                        pdfBitmap?.let { bmp ->
+                        val currentPdfIndex = currentPage?.pdfPageIndex
+                        val pagePdfBmp = if (currentPdfIndex != null) (pdfBitmaps[currentPdfIndex] ?: pdfBitmap) else null
+
+                        if (pagePdfBmp != null) {
                             drawImage(
-                                image = bmp.asImageBitmap(),
+                                image = pagePdfBmp.asImageBitmap(),
                                 dstOffset = IntOffset.Zero,
                                 dstSize = IntSize(pageW.toInt(), pageH.toInt())
                             )
-                        } ?: run {
+                        } else {
                             currentPage?.template?.let { tmpl ->
                                 TemplateRenderer.drawTemplate(this, tmpl, pageW, pageH)
                             }
@@ -1494,42 +1605,57 @@ fun NotebookEditorScreen(
 
                         // 11. Draw PDF Reading Guide Overlay (Red Border with White Center, interactive toggle/drag)
                         if (showReadingGuide) {
-                            val rY = readingGuideY.coerceIn(4f, pageH - 4f)
-                            val guideHeight = 8f / totalScale
+                            val rY = readingGuideY.coerceIn(6f, pageH - 6f)
+                            val guideHeight = 12f / totalScale
+                            val borderThickness = 2.5f / totalScale
 
-                            // Outer red border (top and bottom)
+                            // 1. Top Red Border
                             drawRect(
-                                color = Color(0xFFDC2626).copy(alpha = 0.95f),
+                                color = Color(0xFFDC2626),
                                 topLeft = Offset(0f, rY - guideHeight / 2f),
-                                size = Size(pageW, guideHeight)
+                                size = Size(pageW, borderThickness)
                             )
-                            // White inner stripe
+                            // 2. White Center Stripe (semi-translucent so text behind is legible)
                             drawRect(
-                                color = Color.White.copy(alpha = 0.90f),
-                                topLeft = Offset(0f, rY - guideHeight / 4f),
-                                size = Size(pageW, guideHeight / 2f)
+                                color = Color.White.copy(alpha = 0.88f),
+                                topLeft = Offset(0f, rY - guideHeight / 2f + borderThickness),
+                                size = Size(pageW, guideHeight - borderThickness * 2)
+                            )
+                            // 3. Bottom Red Border
+                            drawRect(
+                                color = Color(0xFFDC2626),
+                                topLeft = Offset(0f, rY + guideHeight / 2f - borderThickness),
+                                size = Size(pageW, borderThickness)
                             )
 
-                            // Reading Guide Handle indicator on the left & right margins
-                            drawCircle(
+                            // 4. Reading Guide Handle tabs on left and right margins
+                            val tabW = 28f / totalScale
+                            val tabH = 16f / totalScale
+                            // Left tab
+                            drawRoundRect(
                                 color = Color(0xFFDC2626),
-                                radius = 7f / totalScale,
-                                center = Offset(14f / totalScale, rY)
+                                topLeft = Offset(2f, rY - tabH / 2f),
+                                size = Size(tabW, tabH),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(tabH / 2f, tabH / 2f)
                             )
-                            drawCircle(
+                            drawRoundRect(
                                 color = Color.White,
-                                radius = 3.5f / totalScale,
-                                center = Offset(14f / totalScale, rY)
+                                topLeft = Offset(4f, rY - (tabH - 4f) / 2f),
+                                size = Size(tabW - 4f, tabH - 4f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
                             )
-                            drawCircle(
+                            // Right tab
+                            drawRoundRect(
                                 color = Color(0xFFDC2626),
-                                radius = 7f / totalScale,
-                                center = Offset(pageW - 14f / totalScale, rY)
+                                topLeft = Offset(pageW - tabW - 2f, rY - tabH / 2f),
+                                size = Size(tabW, tabH),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(tabH / 2f, tabH / 2f)
                             )
-                            drawCircle(
+                            drawRoundRect(
                                 color = Color.White,
-                                radius = 3.5f / totalScale,
-                                center = Offset(pageW - 14f / totalScale, rY)
+                                topLeft = Offset(pageW - tabW, rY - (tabH - 4f) / 2f),
+                                size = Size(tabW - 4f, tabH - 4f),
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
                             )
                         }
                     }
@@ -1981,7 +2107,7 @@ fun NotebookEditorScreen(
 
                         IconButton(
                             onClick = {
-                                val targetScale = (availableW - margin * 2) / (pageW * fitScale)
+                                val targetScale = (availableW - margin * 2) / (pageW * baseScale)
                                 zoomScale = targetScale.coerceIn(0.4f, 5.0f)
                                 panOffset = Offset.Zero
                             },
@@ -2450,7 +2576,7 @@ fun NotebookEditorScreen(
                                         coroutineScope.launch {
                                             val deleted = repository.deletePage(p.id, documentId)
                                             if (deleted) {
-                                                currentPageIndex = currentPageIndex.coerceAtMost(pages.size - 2)
+                                                navigateToPage(currentPageIndex.coerceAtMost(pages.size - 2))
                                                 Toast.makeText(context, "Page deleted", Toast.LENGTH_SHORT).show()
                                             }
                                         }
@@ -2517,7 +2643,7 @@ fun NotebookEditorScreen(
                                     .fillMaxWidth()
                                     .height(140.dp)
                                     .clickable {
-                                        currentPageIndex = p.index
+                                        navigateToPage(p.index)
                                         showPageManagerSheet = false
                                     },
                                 shape = RoundedCornerShape(10.dp),
@@ -2740,7 +2866,7 @@ fun NotebookEditorScreen(
                                 }
                                 val newPage = repository.insertPageAt(documentId, afterIdx, insertPageSelectedTemplate)
                                 val newIndex = (afterIdx + 1).coerceIn(0, pages.size)
-                                currentPageIndex = newIndex
+                                navigateToPage(newIndex)
                                 showInsertPageDialog = false
                                 showPageManagerSheet = false
                                 Toast.makeText(context, "Page inserted at position ${newIndex + 1}!", Toast.LENGTH_SHORT).show()

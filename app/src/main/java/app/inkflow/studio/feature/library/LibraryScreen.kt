@@ -1,5 +1,6 @@
 package app.inkflow.studio.feature.library
 
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -37,7 +38,9 @@ import app.inkflow.studio.domain.model.Document
 import app.inkflow.studio.domain.model.DocumentType
 import app.inkflow.studio.domain.model.Folder
 import app.inkflow.studio.domain.model.PageTemplate
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -101,23 +104,48 @@ fun LibraryScreen(
         }
     }
 
+    var isImportingPdf by remember { mutableStateOf(false) }
+
     // PDF Picker Launcher with safe error handling
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
-            val extractedTitle = resolvePdfTitle(it)
-            coroutineScope.launch {
-                try {
-                    val doc = repository.createPdfDocument(
-                        title = extractedTitle,
-                        uri = it
-                    )
+        if (uri == null) return@rememberLauncherForActivityResult
+        val extractedTitle = resolvePdfTitle(uri)
+        try {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+            context.contentResolver.takePersistableUriPermission(uri, flags)
+        } catch (_: Exception) {}
+
+        isImportingPdf = true
+        coroutineScope.launch {
+            try {
+                val doc = repository.createPdfDocument(
+                    title = extractedTitle,
+                    uri = uri
+                )
+                withContext(Dispatchers.Main) {
+                    isImportingPdf = false
                     onOpenDocument(doc)
-                } catch (e: Exception) {
-                    e.printStackTrace()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    isImportingPdf = false
                     Toast.makeText(context, "Could not import PDF: ${e.localizedMessage ?: "Invalid file"}", Toast.LENGTH_LONG).show()
                 }
+            }
+        }
+    }
+
+    fun launchPdfPicker() {
+        try {
+            pdfPickerLauncher.launch(arrayOf("application/pdf"))
+        } catch (_: Exception) {
+            try {
+                pdfPickerLauncher.launch(arrayOf("*/*"))
+            } catch (e2: Exception) {
+                Toast.makeText(context, "No PDF picker available on device", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -303,14 +331,7 @@ fun LibraryScreen(
                             }
 
                             OutlinedButton(
-                                onClick = {
-                                    try {
-                                        pdfPickerLauncher.launch(arrayOf("application/pdf"))
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
-                                        Toast.makeText(context, "No PDF picker available on device", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
+                                onClick = { launchPdfPicker() },
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -456,13 +477,7 @@ fun LibraryScreen(
                             )
                             if (selectedFilter == LibraryFilter.PDFS) {
                                 Button(
-                                    onClick = {
-                                        try {
-                                            pdfPickerLauncher.launch(arrayOf("application/pdf"))
-                                        } catch (e: Exception) {
-                                            Toast.makeText(context, "No PDF picker available", Toast.LENGTH_SHORT).show()
-                                        }
-                                    },
+                                    onClick = { launchPdfPicker() },
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
                                     Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -534,6 +549,29 @@ fun LibraryScreen(
                                 }
                             )
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // PDF Importing Progress Indicator
+    if (isImportingPdf) {
+        androidx.compose.ui.window.Dialog(onDismissRequest = {}) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 6.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(24.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(36.dp))
+                    Column {
+                        Text("Importing PDF…", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                        Text("Reading pages and preparing workspace", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }

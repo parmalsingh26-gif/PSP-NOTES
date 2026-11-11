@@ -79,6 +79,51 @@ class PageInsertionTest {
     }
 
     @Test
+    fun testPdfMidDocumentPageInsertionPreservesPdfPageIndexMapping() {
+        // PDF originally has 3 pages: pdfPageIndex 0, 1, 2
+        val pdfPages = listOf(
+            Page(id = "p0", documentId = "pdfDoc", index = 0, template = PageTemplate.BLANK, pdfPageIndex = 0),
+            Page(id = "p1", documentId = "pdfDoc", index = 1, template = PageTemplate.BLANK, pdfPageIndex = 1),
+            Page(id = "p2", documentId = "pdfDoc", index = 2, template = PageTemplate.BLANK, pdfPageIndex = 2)
+        )
+
+        // Insert a Ruled Note page between PDF Page 0 and PDF Page 1 (at position 1)
+        val insertIndex = 1
+        val shifted = pdfPages.map {
+            if (it.index >= insertIndex) it.copy(index = it.index + 1) else it
+        }.toMutableList()
+
+        val insertedPaperPage = Page(
+            id = "note-p",
+            documentId = "pdfDoc",
+            index = insertIndex,
+            template = PageTemplate.RULED,
+            pdfPageIndex = null // User-inserted note page, NOT a PDF file page
+        )
+        shifted.add(insertedPaperPage)
+
+        val sorted = shifted.sortedBy { it.index }
+        assertEquals(4, sorted.size)
+
+        // Page 0 is original PDF page 0
+        assertEquals(0, sorted[0].index)
+        assertEquals(0, sorted[0].pdfPageIndex)
+
+        // Page 1 is the inserted Ruled note page
+        assertEquals(1, sorted[1].index)
+        assertEquals(PageTemplate.RULED, sorted[1].template)
+        assertNull(sorted[1].pdfPageIndex)
+
+        // Page 2 is original PDF page 1
+        assertEquals(2, sorted[2].index)
+        assertEquals(1, sorted[2].pdfPageIndex)
+
+        // Page 3 is original PDF page 2
+        assertEquals(3, sorted[3].index)
+        assertEquals(2, sorted[3].pdfPageIndex)
+    }
+
+    @Test
     fun testAllPageTemplatesAvailable() {
         val templates = PageTemplate.entries
         assertTrue(templates.contains(PageTemplate.BLANK))

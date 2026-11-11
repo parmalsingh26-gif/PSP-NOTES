@@ -106,6 +106,37 @@ class PageImageTest {
     }
 
     @Test
+    fun testTapInsideImageSelectsForReEditing() {
+        val image = PageImageObject(
+            id = "img-reedit",
+            pageId = "p1",
+            filePath = "/img.png",
+            x = 100f,
+            y = 150f,
+            width = 200f,
+            height = 180f
+        )
+        val images = listOf(image)
+
+        // Point inside image
+        val insideX = 150f
+        val insideY = 200f
+        val tappedInside = images.lastOrNull { img ->
+            insideX in img.x..(img.x + img.width) && insideY in img.y..(img.y + img.height)
+        }
+        assertNotNull(tappedInside)
+        assertEquals("img-reedit", tappedInside?.id)
+
+        // Point outside image
+        val outsideX = 50f
+        val outsideY = 50f
+        val tappedOutside = images.lastOrNull { img ->
+            outsideX in img.x..(img.x + img.width) && outsideY in img.y..(img.y + img.height)
+        }
+        assertNull(tappedOutside)
+    }
+
+    @Test
     fun testPageImagePageIdSeparation() {
         // Verify images on different pages maintain separate pageIds
         val imgPage1 = PageImageObject(id = "i1", pageId = "page-1", filePath = "/p1.png", x = 10f, y = 10f)

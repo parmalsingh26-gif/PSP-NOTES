@@ -13,7 +13,8 @@ data class PageEntity(
     val width: Float,
     val height: Float,
     val template: String,
-    val isBookmarked: Boolean
+    val isBookmarked: Boolean,
+    val pdfPageIndex: Int? = null
 ) {
     fun toDomain(): Page = Page(
         id = id,
@@ -23,7 +24,8 @@ data class PageEntity(
         height = height,
         template = try { PageTemplate.valueOf(template) } catch (e: Exception) { PageTemplate.RULED },
         isBookmarked = isBookmarked,
-        strokes = emptyList() // Loaded on-demand from StrokeFileStore
+        strokes = emptyList(), // Loaded on-demand from StrokeFileStore
+        pdfPageIndex = pdfPageIndex
     )
 
     companion object {
@@ -34,8 +36,8 @@ data class PageEntity(
             width = page.width,
             height = page.height,
             template = page.template.name,
-            isBookmarked = page.isBookmarked
+            isBookmarked = page.isBookmarked,
+            pdfPageIndex = page.pdfPageIndex
         )
     }
 }
-
