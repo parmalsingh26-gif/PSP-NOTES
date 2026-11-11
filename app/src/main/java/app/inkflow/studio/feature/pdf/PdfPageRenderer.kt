@@ -16,6 +16,8 @@ class PdfPageRenderer(private val pdfFile: File) {
     private var fileDescriptor: ParcelFileDescriptor? = null
     private var pdfRenderer: PdfRenderer? = null
     private val renderMutex = Mutex()
+    @Volatile
+    private var isClosed = false
 
     // Cache up to 10 rendered bitmaps to prevent excessive memory usage while keeping navigation snappy
     private val bitmapCache = object : LruCache<Int, Bitmap>(10) {
@@ -28,38 +30,55 @@ class PdfPageRenderer(private val pdfFile: File) {
         openRendererSafely()
     }
 
-    private fun openRendererSafely() {
+    private fun openRendererSafely() = synchronized(this) {
+        if (isClosed) return@synchronized
         try {
             if (pdfFile.exists() && pdfFile.length() > 0) {
+                fileDescriptor?.close()
                 fileDescriptor = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
                 fileDescriptor?.let {
+                    pdfRenderer?.close()
                     pdfRenderer = PdfRenderer(it)
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (t: Throwable) {
+            t.printStackTrace()
             pdfRenderer = null
             fileDescriptor = null
         }
     }
 
     val pageCount: Int
-        get() = pdfRenderer?.pageCount ?: 0
+        get() = synchronized(this) {
+            try {
+                if (pdfRenderer == null && !isClosed) {
+                    openRendererSafely()
+                }
+                pdfRenderer?.pageCount ?: 0
+            } catch (t: Throwable) {
+                0
+            }
+        }
 
     suspend fun renderPage(pageIndex: Int, targetWidth: Int = 1080, targetHeight: Int = 1528): Bitmap? =
         withContext(Dispatchers.IO) {
+            if (isClosed) return@withContext null
             bitmapCache.get(pageIndex)?.let { return@withContext it }
 
             renderMutex.withLock {
+                if (isClosed) return@withLock null
                 // Re-check cache under lock
                 bitmapCache.get(pageIndex)?.let { return@withLock it }
 
-                if (pdfRenderer == null) {
-                    openRendererSafely()
+                synchronized(this@PdfPageRenderer) {
+                    if (pdfRenderer == null && !isClosed) {
+                        openRendererSafely()
+                    }
                 }
 
-                val renderer = pdfRenderer ?: return@withLock null
-                if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withLock null
+                val renderer = synchronized(this@PdfPageRenderer) { pdfRenderer } ?: return@withLock null
+                val totalCount = try { renderer.pageCount } catch (_: Throwable) { 0 }
+                if (pageIndex < 0 || pageIndex >= totalCount) return@withLock null
 
                 var page: PdfRenderer.Page? = null
                 try {
@@ -88,21 +107,30 @@ class PdfPageRenderer(private val pdfFile: File) {
                     bitmap
                 } catch (t: Throwable) {
                     t.printStackTrace()
-                    page?.close()
+                    try { page?.close() } catch (_: Throwable) {}
                     null
                 }
             }
         }
 
     fun close() {
-        try {
-            bitmapCache.evictAll()
-            pdfRenderer?.close()
-            pdfRenderer = null
-            fileDescriptor?.close()
-            fileDescriptor = null
-        } catch (e: Exception) {
-            e.printStackTrace()
+        isClosed = true
+        bitmapCache.evictAll()
+        synchronized(this) {
+            try {
+                pdfRenderer?.close()
+            } catch (t: Throwable) {
+                t.printStackTrace()
+            } finally {
+                pdfRenderer = null
+            }
+            try {
+                fileDescriptor?.close()
+            } catch (t: Throwable) {
+                t.printStackTrace()
+            } finally {
+                fileDescriptor = null
+            }
         }
     }
 }

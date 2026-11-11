@@ -106,46 +106,61 @@ fun LibraryScreen(
 
     var isImportingPdf by remember { mutableStateOf(false) }
 
-    // PDF Picker Launcher with safe error handling
-    val pdfPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        val extractedTitle = resolvePdfTitle(uri)
-        try {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
-            context.contentResolver.takePersistableUriPermission(uri, flags)
-        } catch (_: Exception) {}
-
-        isImportingPdf = true
-        coroutineScope.launch {
+    // Safe PDF URI Import handler
+    val handleSelectedPdfUri: (Uri?) -> Unit = { uri: Uri? ->
+        if (uri != null) {
+            val extractedTitle = resolvePdfTitle(uri)
             try {
-                val doc = repository.createPdfDocument(
-                    title = extractedTitle,
-                    uri = uri
-                )
-                withContext(Dispatchers.Main) {
-                    isImportingPdf = false
-                    onOpenDocument(doc)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                withContext(Dispatchers.Main) {
-                    isImportingPdf = false
-                    Toast.makeText(context, "Could not import PDF: ${e.localizedMessage ?: "Invalid file"}", Toast.LENGTH_LONG).show()
+                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                context.contentResolver.takePersistableUriPermission(uri, flags)
+            } catch (_: Throwable) {}
+
+            isImportingPdf = true
+            coroutineScope.launch {
+                try {
+                    val doc = repository.createPdfDocument(
+                        title = extractedTitle,
+                        uri = uri
+                    )
+                    withContext(Dispatchers.Main) {
+                        isImportingPdf = false
+                        onOpenDocument(doc)
+                    }
+                } catch (t: Throwable) {
+                    t.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        isImportingPdf = false
+                        Toast.makeText(context, "Could not import PDF: ${t.localizedMessage ?: "Invalid file"}", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
     }
 
+    // PDF OpenDocument Launcher
+    val pdfPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = handleSelectedPdfUri
+    )
+
+    // PDF GetContent Launcher as rock-solid universal fallback
+    val pdfGetContentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+        onResult = handleSelectedPdfUri
+    )
+
     fun launchPdfPicker() {
         try {
             pdfPickerLauncher.launch(arrayOf("application/pdf"))
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             try {
-                pdfPickerLauncher.launch(arrayOf("*/*"))
-            } catch (e2: Exception) {
-                Toast.makeText(context, "No PDF picker available on device", Toast.LENGTH_SHORT).show()
+                pdfGetContentLauncher.launch("application/pdf")
+            } catch (_: Throwable) {
+                try {
+                    pdfPickerLauncher.launch(arrayOf("*/*"))
+                } catch (e3: Throwable) {
+                    Toast.makeText(context, "No PDF picker available on device", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }

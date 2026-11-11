@@ -164,7 +164,7 @@ fun NotebookEditorScreen(
     var rulerDragStart by remember { mutableStateOf<Pair<Float, Float>?>(null) }
 
     // Fit Width View Mode (Fits PDF page to device width for reading without side margins)
-    var isFitWidth by remember { mutableStateOf(document?.type == DocumentType.PDF) }
+    var isFitWidth by remember { mutableStateOf(true) }
 
     // Touch gesture tracking for click vs draw detection
     var touchDownDocX by remember { mutableFloatStateOf(0f) }
@@ -451,29 +451,39 @@ fun NotebookEditorScreen(
     }
 
     // View Mode: Continuous Vertical Scrolling (like standard PDF / Acrobat) vs Single Page Flip
-    var isContinuousVerticalScroll by remember { mutableStateOf(document?.type == DocumentType.PDF) }
+    var isContinuousVerticalScroll by remember { mutableStateOf(true) }
     val pdfBitmaps = remember { mutableStateMapOf<Int, Bitmap>() }
 
+    // Synchronize default modes once document metadata loads
+    LaunchedEffect(document?.id, document?.type) {
+        if (document?.type == DocumentType.PDF) {
+            isFitWidth = true
+            isContinuousVerticalScroll = true
+        }
+    }
+
     // Render PDF page bitmap whenever currentPageIndex, pdfRenderer, or isContinuousVerticalScroll changes
-    LaunchedEffect(currentPageIndex, pdfRenderer, isContinuousVerticalScroll, currentPage?.pdfPageIndex) {
+    LaunchedEffect(currentPageIndex, pdfRenderer, isContinuousVerticalScroll, currentPage?.pdfPageIndex, pages) {
         pdfRenderer?.let { renderer ->
             val pCount = renderer.pageCount
             if (pCount <= 0) return@LaunchedEffect
 
-            val currentPdfIdx = currentPage?.pdfPageIndex
+            val isPdfDoc = document?.type == DocumentType.PDF
+            val currentPdfIdx = currentPage?.pdfPageIndex ?: (if (isPdfDoc) currentPageIndex else null)
+
             val pagesToLoad = if (isContinuousVerticalScroll && pCount > 1) {
-                pages.filter { it.pdfPageIndex != null && abs(it.index - currentPageIndex) <= 2 }
-                    .mapNotNull { it.pdfPageIndex }
+                pages.filter { abs(it.index - currentPageIndex) <= 3 }
+                    .mapNotNull { it.pdfPageIndex ?: (if (isPdfDoc) it.index else null) }
             } else {
                 listOfNotNull(currentPdfIdx)
             }
 
             // Evict distant bitmaps from Compose state to prevent heap exhaustion
             val activePdfIdx = currentPdfIdx ?: 0
-            pdfBitmaps.keys.filter { abs(it - activePdfIdx) > 3 }.forEach { pdfBitmaps.remove(it) }
+            pdfBitmaps.keys.filter { abs(it - activePdfIdx) > 4 }.forEach { pdfBitmaps.remove(it) }
 
             for (idx in pagesToLoad) {
-                if (!pdfBitmaps.containsKey(idx)) {
+                if (idx in 0 until pCount && !pdfBitmaps.containsKey(idx)) {
                     val bmp = renderer.renderPage(idx)
                     if (bmp != null) {
                         pdfBitmaps[idx] = bmp
@@ -757,15 +767,15 @@ fun NotebookEditorScreen(
                 val pageW = currentPage?.width ?: 595f
                 val pageH = currentPage?.height ?: 842f
 
-                val margin = 24f
-                val fitScaleX = (availableW - margin * 2) / pageW
+                val margin = if (isFitWidth) 0f else 20f
+                val fitScaleX = if (isFitWidth) availableW / pageW else (availableW - margin * 2) / pageW
                 val fitScaleY = (availableH - margin * 2) / pageH
-                val baseScale = if (isFitWidth) fitScaleX.coerceIn(0.2f, 3.5f) else min(fitScaleX, fitScaleY).coerceAtLeast(0.1f)
+                val baseScale = if (isFitWidth) fitScaleX.coerceIn(0.2f, 4.0f) else min(fitScaleX, fitScaleY).coerceAtLeast(0.1f)
 
                 val totalScale = baseScale * zoomScale
 
-                val originX = if (isFitWidth) margin else (availableW - pageW * totalScale) / 2f
-                val originY = (availableH - pageH * totalScale) / 2f
+                val originX = if (isFitWidth) 0f else (availableW - pageW * totalScale) / 2f
+                val originY = if (isContinuousVerticalScroll) 16f else (availableH - pageH * totalScale) / 2f
 
                 Box(
                     modifier = Modifier
@@ -797,6 +807,18 @@ fun NotebookEditorScreen(
                                             panOffset += (mid - lastPinchMid)
                                             lastPinchDist = dist
                                             lastPinchMid = mid
+
+                                            if (isContinuousVerticalScroll && pages.size > 1) {
+                                                val pageGap = 24f
+                                                val pageTotalH = (pageH + pageGap) * totalScale
+                                                if (panOffset.y < -pageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
+                                                    navigateToPage(currentPageIndex + 1)
+                                                    panOffset = panOffset.copy(y = panOffset.y + pageTotalH)
+                                                } else if (panOffset.y > pageTotalH * 0.5f && currentPageIndex > 0) {
+                                                    navigateToPage(currentPageIndex - 1)
+                                                    panOffset = panOffset.copy(y = panOffset.y - pageTotalH)
+                                                }
+                                            }
                                         }
                                     }
                                     MotionEvent.ACTION_POINTER_UP -> {
@@ -1164,6 +1186,18 @@ fun NotebookEditorScreen(
                                                 val dy = touchY - start.second
                                                 panOffset += Offset(dx, dy)
                                                 imageDragStartPoint = Pair(touchX, touchY)
+
+                                                if (isContinuousVerticalScroll && pages.size > 1) {
+                                                    val pageGap = 24f
+                                                    val pageTotalH = (pageH + pageGap) * totalScale
+                                                    if (panOffset.y < -pageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
+                                                        navigateToPage(currentPageIndex + 1)
+                                                        panOffset = panOffset.copy(y = panOffset.y + pageTotalH)
+                                                    } else if (panOffset.y > pageTotalH * 0.5f && currentPageIndex > 0) {
+                                                        navigateToPage(currentPageIndex - 1)
+                                                        panOffset = panOffset.copy(y = panOffset.y - pageTotalH)
+                                                    }
+                                                }
                                             }
                                         }
                                         else -> {
@@ -1317,32 +1351,85 @@ fun NotebookEditorScreen(
                                 transformOrigin = TransformOrigin(0f, 0f)
                             }
                     ) {
-                        // 1. Page Canvas Surface
-                        drawRect(
-                            color = Color.White,
-                            topLeft = Offset.Zero,
-                            size = Size(pageW, pageH)
-                        )
-                        drawRect(
-                            color = Color(0xFFCBD5E1),
-                            topLeft = Offset.Zero,
-                            size = Size(pageW, pageH),
-                            style = Stroke(width = 1f)
-                        )
+                        // 1 & 2. Draw Page Background and PDF Bitmaps / Templates
+                        if (isContinuousVerticalScroll && pages.isNotEmpty()) {
+                            val pageGap = 24f
+                            val pageTotalH = pageH + pageGap
+                            val minIdx = (currentPageIndex - 2).coerceAtLeast(0)
+                            val maxIdx = (currentPageIndex + 2).coerceAtMost(pages.size - 1)
 
-                        // 2. PDF Background or Paper Template
-                        val currentPdfIndex = currentPage?.pdfPageIndex
-                        val pagePdfBmp = if (currentPdfIndex != null) (pdfBitmaps[currentPdfIndex] ?: pdfBitmap) else null
+                            for (idx in minIdx..maxIdx) {
+                                val p = pages[idx]
+                                val yOffset = (idx - currentPageIndex) * pageTotalH
 
-                        if (pagePdfBmp != null) {
-                            drawImage(
-                                image = pagePdfBmp.asImageBitmap(),
-                                dstOffset = IntOffset.Zero,
-                                dstSize = IntSize(pageW.toInt(), pageH.toInt())
-                            )
+                                // Page Surface White Background
+                                drawRect(
+                                    color = Color.White,
+                                    topLeft = Offset(0f, yOffset),
+                                    size = Size(pageW, pageH)
+                                )
+                                // Subtle Page Border / Shadow
+                                drawRect(
+                                    color = Color(0xFFCBD5E1),
+                                    topLeft = Offset(0f, yOffset),
+                                    size = Size(pageW, pageH),
+                                    style = Stroke(width = 1f)
+                                )
+
+                                val pdfIdx = p.pdfPageIndex ?: (if (document?.type == DocumentType.PDF) p.index else null)
+                                val pBmp = if (pdfIdx != null) (pdfBitmaps[pdfIdx] ?: (if (idx == currentPageIndex) pdfBitmap else null)) else null
+
+                                if (pBmp != null) {
+                                    drawImage(
+                                        image = pBmp.asImageBitmap(),
+                                        dstOffset = IntOffset(0, yOffset.toInt()),
+                                        dstSize = IntSize(pageW.toInt(), pageH.toInt())
+                                    )
+                                } else {
+                                    drawContext.canvas.save()
+                                    drawContext.canvas.translate(0f, yOffset)
+                                    TemplateRenderer.drawTemplate(this, p.template, pageW, pageH)
+                                    drawContext.canvas.restore()
+                                }
+
+                                // Inter-page dashed line & page divider badge
+                                if (idx < pages.size - 1) {
+                                    drawLine(
+                                        color = Color(0xFF94A3B8),
+                                        start = Offset(0f, yOffset + pageH + pageGap / 2f),
+                                        end = Offset(pageW, yOffset + pageH + pageGap / 2f),
+                                        strokeWidth = 1f,
+                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
+                                    )
+                                }
+                            }
                         } else {
-                            currentPage?.template?.let { tmpl ->
-                                TemplateRenderer.drawTemplate(this, tmpl, pageW, pageH)
+                            // Single Page View
+                            drawRect(
+                                color = Color.White,
+                                topLeft = Offset.Zero,
+                                size = Size(pageW, pageH)
+                            )
+                            drawRect(
+                                color = Color(0xFFCBD5E1),
+                                topLeft = Offset.Zero,
+                                size = Size(pageW, pageH),
+                                style = Stroke(width = 1f)
+                            )
+
+                            val effectivePdfIdx = currentPage?.pdfPageIndex ?: (if (document?.type == DocumentType.PDF) currentPageIndex else null)
+                            val pagePdfBmp = if (effectivePdfIdx != null) (pdfBitmaps[effectivePdfIdx] ?: pdfBitmap) else null
+
+                            if (pagePdfBmp != null) {
+                                drawImage(
+                                    image = pagePdfBmp.asImageBitmap(),
+                                    dstOffset = IntOffset.Zero,
+                                    dstSize = IntSize(pageW.toInt(), pageH.toInt())
+                                )
+                            } else {
+                                currentPage?.template?.let { tmpl ->
+                                    TemplateRenderer.drawTemplate(this, tmpl, pageW, pageH)
+                                }
                             }
                         }
 

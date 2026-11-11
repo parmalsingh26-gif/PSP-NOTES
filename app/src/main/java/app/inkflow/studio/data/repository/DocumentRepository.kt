@@ -107,19 +107,34 @@ class DocumentRepository(
                         throw IllegalArgumentException("The selected PDF contains no readable pages.")
                     }
 
+                    var defaultW = 595f
+                    var defaultH = 842f
+                    try {
+                        val p0 = renderer.openPage(0)
+                        if (p0.width > 0) defaultW = p0.width.toFloat()
+                        if (p0.height > 0) defaultH = p0.height.toFloat()
+                        p0.close()
+                    } catch (_: Throwable) {}
+
                     for (idx in 0 until actualPageCount) {
-                        val pdfPage = renderer.openPage(idx)
-                        val w = pdfPage.width.toFloat()
-                        val h = pdfPage.height.toFloat()
-                        pdfPage.close()
+                        var w = defaultW
+                        var h = defaultH
+                        if (idx > 0 && actualPageCount <= 50) {
+                            try {
+                                val pdfPage = renderer.openPage(idx)
+                                if (pdfPage.width > 0) w = pdfPage.width.toFloat()
+                                if (pdfPage.height > 0) h = pdfPage.height.toFloat()
+                                pdfPage.close()
+                            } catch (_: Throwable) {}
+                        }
 
                         pages.add(
                             PageEntity(
                                 id = UUID.randomUUID().toString(),
                                 documentId = docId,
                                 pageIndex = idx,
-                                width = if (w > 0f) w else 595f,
-                                height = if (h > 0f) h else 842f,
+                                width = w,
+                                height = h,
                                 template = PageTemplate.BLANK.name,
                                 isBookmarked = false,
                                 pdfPageIndex = idx

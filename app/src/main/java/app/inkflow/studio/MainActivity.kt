@@ -60,7 +60,11 @@ class MainActivity : ComponentActivity() {
             if (uri != null && (intent.type == "application/pdf" || uri.toString().endsWith(".pdf", ignoreCase = true))) {
                 val resolvedTitle = extractDisplayName(uri) ?: "Imported Document"
                 lifecycleScope.launch {
-                    repository.createPdfDocument(resolvedTitle, uri)
+                    try {
+                        repository.createPdfDocument(resolvedTitle, uri)
+                    } catch (t: Throwable) {
+                        t.printStackTrace()
+                    }
                 }
             }
         }
