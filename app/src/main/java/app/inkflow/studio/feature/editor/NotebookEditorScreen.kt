@@ -172,11 +172,13 @@ fun NotebookEditorScreen(
     var touchDownTime by remember { mutableLongStateOf(0L) }
     var potentialTappedImageId by remember { mutableStateOf<String?>(null) }
 
-    // PDF Reading Guide (Red Line Overlay)
+    // PDF Reading Guide (Red Line Overlay with trail/fade effect)
     var showReadingGuide by remember { mutableStateOf(false) }
     var readingGuideY by remember { mutableFloatStateOf(300f) }
     var isDraggingReadingGuide by remember { mutableStateOf(false) }
     var readingGuideLastTapTime by remember { mutableLongStateOf(0L) }
+    // Trail: last 6 positions that fade out behind the reading guide
+    var readingGuideTrail by remember { mutableStateOf<List<Float>>(emptyList()) }
 
     // Preset Shapes State
     var selectedPresetShape by remember { mutableStateOf(PresetShapeType.RECTANGLE) }
@@ -1051,9 +1053,14 @@ fun NotebookEditorScreen(
                                         return@pointerInteropFilter true
                                     }
 
-                                    // Reading guide drag: move the line to finger position
+                                    // Reading guide drag: move the line to finger position (record trail)
                                     if (isDraggingReadingGuide) {
-                                        readingGuideY = rawDocY.coerceIn(10f, pageH - 10f)
+                                        val newY = rawDocY.coerceIn(10f, pageH - 10f)
+                                        if (abs(newY - readingGuideY) > 4f) {
+                                            // Prepend old position to trail, keep last 7 ghost positions
+                                            readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
+                                        }
+                                        readingGuideY = newY
                                         return@pointerInteropFilter true
                                     }
 
@@ -1603,12 +1610,38 @@ fun NotebookEditorScreen(
                             drawContext.canvas.restore()
                         }
 
-                        // 11. Draw PDF Reading Guide Overlay (Red Border with White Center, interactive toggle/drag)
+                        // 11. Draw PDF Reading Guide Overlay (Red Border with White Center, fading trail behind, interactive toggle/drag)
                         if (showReadingGuide) {
                             val rY = readingGuideY.coerceIn(6f, pageH - 6f)
-                            val guideHeight = 12f / totalScale
+                            val guideHeight = 14f / totalScale
                             val borderThickness = 2.5f / totalScale
 
+                            // 11a. Draw fading ghost trail lines BELOW the current guide (behind where the user already read)
+                            readingGuideTrail.forEachIndexed { idx, trailY ->
+                                val trailAlpha = (0.55f - idx * 0.08f).coerceAtLeast(0f)
+                                if (trailAlpha <= 0f) return@forEachIndexed
+                                val ty = trailY.coerceIn(6f, pageH - 6f)
+                                // Top border ghost
+                                drawRect(
+                                    color = Color(0xFFDC2626).copy(alpha = trailAlpha * 0.7f),
+                                    topLeft = Offset(0f, ty - guideHeight / 2f),
+                                    size = Size(pageW, borderThickness)
+                                )
+                                // White center ghost
+                                drawRect(
+                                    color = Color.White.copy(alpha = trailAlpha * 0.5f),
+                                    topLeft = Offset(0f, ty - guideHeight / 2f + borderThickness),
+                                    size = Size(pageW, guideHeight - borderThickness * 2)
+                                )
+                                // Bottom border ghost
+                                drawRect(
+                                    color = Color(0xFFDC2626).copy(alpha = trailAlpha * 0.7f),
+                                    topLeft = Offset(0f, ty + guideHeight / 2f - borderThickness),
+                                    size = Size(pageW, borderThickness)
+                                )
+                            }
+
+                            // 11b. Main Reading Guide (vivid red border, semi-transparent white center)
                             // 1. Top Red Border
                             drawRect(
                                 color = Color(0xFFDC2626),
@@ -1705,7 +1738,7 @@ fun NotebookEditorScreen(
                         Row(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             Box(
                                 modifier = Modifier
@@ -1713,24 +1746,64 @@ fun NotebookEditorScreen(
                                     .clip(CircleShape)
                                     .background(Color(0xFFDC2626))
                             )
-                            Text("Reading Guide", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFFDC2626))
+                            Text("Guide", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFDC2626))
+                            // Fine step up (1 line)
                             IconButton(
-                                onClick = { readingGuideY = (readingGuideY - 26f).coerceAtLeast(10f) },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Prev Line", modifier = Modifier.size(18.dp))
-                            }
-                            IconButton(
-                                onClick = { readingGuideY = (readingGuideY + 26f).coerceAtMost(pageH - 10f) },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Next Line", modifier = Modifier.size(18.dp))
-                            }
-                            IconButton(
-                                onClick = { showReadingGuide = false },
+                                onClick = {
+                                    readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
+                                    readingGuideY = (readingGuideY - 18f).coerceAtLeast(10f)
+                                },
                                 modifier = Modifier.size(26.dp)
                             ) {
-                                Icon(Icons.Default.Close, contentDescription = "Close Reading Guide", modifier = Modifier.size(16.dp))
+                                Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Line Up", modifier = Modifier.size(16.dp))
+                            }
+                            // Coarse step up (~1 paragraph)
+                            IconButton(
+                                onClick = {
+                                    readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
+                                    readingGuideY = (readingGuideY - 50f).coerceAtLeast(10f)
+                                },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(Icons.Default.KeyboardDoubleArrowUp, contentDescription = "Para Up", modifier = Modifier.size(16.dp))
+                            }
+                            // Fine step down
+                            IconButton(
+                                onClick = {
+                                    readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
+                                    readingGuideY = (readingGuideY + 18f).coerceAtMost(pageH - 10f)
+                                },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Line Down", modifier = Modifier.size(16.dp))
+                            }
+                            // Coarse step down
+                            IconButton(
+                                onClick = {
+                                    readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
+                                    readingGuideY = (readingGuideY + 50f).coerceAtMost(pageH - 10f)
+                                },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(Icons.Default.KeyboardDoubleArrowDown, contentDescription = "Para Down", modifier = Modifier.size(16.dp))
+                            }
+                            // Clear fading trail
+                            if (readingGuideTrail.isNotEmpty()) {
+                                IconButton(
+                                    onClick = { readingGuideTrail = emptyList() },
+                                    modifier = Modifier.size(26.dp)
+                                ) {
+                                    Icon(Icons.Default.ClearAll, contentDescription = "Clear Trail", modifier = Modifier.size(16.dp), tint = Color(0xFFDC2626).copy(alpha = 0.7f))
+                                }
+                            }
+                            IconButton(
+                                onClick = {
+                                    showReadingGuide = false
+                                    readingGuideTrail = emptyList()
+                                },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Close Guide", modifier = Modifier.size(16.dp))
                             }
                         }
                     }
@@ -2114,6 +2187,52 @@ fun NotebookEditorScreen(
                             modifier = Modifier.size(28.dp)
                         ) {
                             Icon(Icons.Default.AspectRatio, contentDescription = "Fit Width", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+
+                // Highlighter Quick Color Bar (shown when Highlighter is the active tool)
+                if (activeToolState == ToolType.HIGHLIGHTER) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 94.dp)
+                            .shadow(6.dp, RoundedCornerShape(20.dp)),
+                        shape = RoundedCornerShape(20.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("Highlight:", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            listOf(
+                                0xFFFBBF24L to "Yellow",
+                                0xFF86EFACL to "Green",
+                                0xFFF9A8D4L to "Pink",
+                                0xFF93C5FDL to "Blue",
+                                0xFFFDBA74L to "Orange"
+                            ).forEach { (c, label) ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(26.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(c.toInt()))
+                                        .border(
+                                            width = if (activeColorState == c) 3.dp else 1.dp,
+                                            color = if (activeColorState == c) MaterialTheme.colorScheme.primary else Color.Gray.copy(alpha = 0.4f),
+                                            shape = CircleShape
+                                        )
+                                        .clickable { selectColor(c) },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (activeColorState == c) {
+                                        Icon(Icons.Default.Check, contentDescription = label, modifier = Modifier.size(14.dp), tint = Color.DarkGray)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3414,9 +3533,9 @@ private fun DrawScope.drawStyledInkStroke(
     drawPath(
         path = strokePath,
         color = baseColor,
-        blendMode = if (isHighlight && !isSelected) BlendMode.Darken else BlendMode.SrcOver,
+        blendMode = if (isHighlight && !isSelected) BlendMode.Multiply else BlendMode.SrcOver,
         style = Stroke(
-            width = if (isHighlight) stroke.width * 2.8f else stroke.width,
+            width = if (isHighlight) stroke.width * 3.2f else stroke.width,
             cap = if (isHighlight) StrokeCap.Square else StrokeCap.Round,
             join = StrokeJoin.Round,
             pathEffect = if (isPencil) PathEffect.dashPathEffect(floatArrayOf(stroke.width * 2.2f, stroke.width * 0.35f), 0f) else null
