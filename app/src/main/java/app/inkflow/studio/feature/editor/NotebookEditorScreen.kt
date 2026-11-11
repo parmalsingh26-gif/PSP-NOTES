@@ -8,6 +8,7 @@ import android.net.Uri
 import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
@@ -65,13 +66,17 @@ import app.inkflow.studio.feature.ink.ShapeRecognizer
 import app.inkflow.studio.feature.ink.TemplateRenderer
 import app.inkflow.studio.feature.pdf.PdfExporter
 import app.inkflow.studio.feature.pdf.PdfPageRenderer
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.*
+
+private val editorPersistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 private enum class ImageHandleType {
     NONE,
@@ -80,7 +85,130 @@ private enum class ImageHandleType {
     TOP_RIGHT,
     BOTTOM_LEFT,
     BOTTOM_RIGHT,
-    ROTATE
+    ROTATE,
+    CROP_LEFT,
+    CROP_RIGHT,
+    CROP_TOP,
+    CROP_BOTTOM,
+    CROP_TOP_LEFT,
+    CROP_TOP_RIGHT,
+    CROP_BOTTOM_LEFT,
+    CROP_BOTTOM_RIGHT
+}
+
+private data class LaserPoint(
+    val x: Float,
+    val y: Float,
+    val timestampMs: Long
+)
+
+private data class LaserStrokeTrail(
+    val id: String,
+    val pageId: String,
+    val color: Long,
+    val points: List<LaserPoint>
+)
+
+internal data class UncroppedImageFrame(
+    val fullX: Float,
+    val fullY: Float,
+    val fullW: Float,
+    val fullH: Float,
+    val centerX: Float,
+    val centerY: Float
+)
+
+internal fun inverseRotatePoint(
+    px: Float,
+    py: Float,
+    cx: Float,
+    cy: Float,
+    rotationDeg: Float
+): Pair<Float, Float> {
+    if (rotationDeg == 0f) return Pair(px, py)
+    val rad = Math.toRadians(-rotationDeg.toDouble())
+    val cosA = cos(rad).toFloat()
+    val sinA = sin(rad).toFloat()
+    val dx = px - cx
+    val dy = py - cy
+    return Pair(cx + dx * cosA - dy * sinA, cy + dx * sinA + dy * cosA)
+}
+
+internal fun isPointInsideImage(
+    docX: Float,
+    docY: Float,
+    img: PageImageObject,
+    pad: Float = 8f
+): Boolean {
+    val cx = img.x + img.width / 2f
+    val cy = img.y + img.height / 2f
+    val (localX, localY) = inverseRotatePoint(docX, docY, cx, cy, img.rotationDegrees)
+    return localX in (img.x - pad)..(img.x + img.width + pad) &&
+            localY in (img.y - pad)..(img.y + img.height + pad)
+}
+
+internal fun computeUncroppedFrame(img: PageImageObject): UncroppedImageFrame {
+    val cropW = (img.cropRight - img.cropLeft).coerceAtLeast(0.05f)
+    val cropH = (img.cropBottom - img.cropTop).coerceAtLeast(0.05f)
+    val fullW = img.width / cropW
+    val fullH = img.height / cropH
+    val fullX = img.x - img.cropLeft * fullW
+    val fullY = img.y - img.cropTop * fullH
+    return UncroppedImageFrame(
+        fullX = fullX,
+        fullY = fullY,
+        fullW = fullW,
+        fullH = fullH,
+        centerX = img.x + img.width / 2f,
+        centerY = img.y + img.height / 2f
+    )
+}
+
+internal fun applyImageCrop(
+    img: PageImageObject,
+    liveLeft: Float,
+    liveTop: Float,
+    liveRight: Float,
+    liveBottom: Float
+): PageImageObject {
+    val safeL = liveLeft.coerceIn(0f, 0.92f)
+    val safeT = liveTop.coerceIn(0f, 0.92f)
+    val safeR = liveRight.coerceIn(safeL + 0.05f, 1f)
+    val safeB = liveBottom.coerceIn(safeT + 0.05f, 1f)
+
+    val frame = computeUncroppedFrame(img)
+    val newW = ((safeR - safeL) * frame.fullW).coerceAtLeast(24f)
+    val newH = ((safeB - safeT) * frame.fullH).coerceAtLeast(24f)
+
+    val localNewX = frame.fullX + safeL * frame.fullW
+    val localNewY = frame.fullY + safeT * frame.fullH
+    val localNewCx = localNewX + newW / 2f
+    val localNewCy = localNewY + newH / 2f
+
+    val flippedCx = if (img.isFlippedHorizontal) 2f * frame.centerX - localNewCx else localNewCx
+    val flippedCy = if (img.isFlippedVertical) 2f * frame.centerY - localNewCy else localNewCy
+
+    val (worldCx, worldCy) = if (img.rotationDegrees != 0f) {
+        val rad = Math.toRadians(img.rotationDegrees.toDouble())
+        val cosA = cos(rad).toFloat()
+        val sinA = sin(rad).toFloat()
+        val dx = flippedCx - frame.centerX
+        val dy = flippedCy - frame.centerY
+        Pair(frame.centerX + dx * cosA - dy * sinA, frame.centerY + dx * sinA + dy * cosA)
+    } else {
+        Pair(flippedCx, flippedCy)
+    }
+
+    return img.copy(
+        x = worldCx - newW / 2f,
+        y = worldCy - newH / 2f,
+        width = newW,
+        height = newH,
+        cropLeft = safeL,
+        cropTop = safeT,
+        cropRight = safeR,
+        cropBottom = safeB
+    )
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -121,10 +249,41 @@ fun NotebookEditorScreen(
         inkEngine.currentWidth = width
     }
 
-    var currentStrokes by remember { mutableStateOf<List<InkStroke>>(emptyList()) }
-    var pageTexts by remember { mutableStateOf<List<PageTextObject>>(emptyList()) }
-    var pageImages by remember { mutableStateOf<List<PageImageObject>>(emptyList()) }
+    // Authoritative multi-page in-memory state keyed by pageId so continuous scroll renders all
+    // visible pages' ink, images, and text notes without ever overwriting or losing edits on scroll.
+    val pageStrokesMap = remember { mutableStateMapOf<String, List<InkStroke>>() }
+    val pageTextsMap = remember { mutableStateMapOf<String, List<PageTextObject>>() }
+    val pageImagesMap = remember { mutableStateMapOf<String, List<PageImageObject>>() }
+    val loadedPageIds = remember { mutableStateMapOf<String, Boolean>() }
+
+    val currentPageId = currentPage?.id
+    val currentStrokes: List<InkStroke> = currentPageId?.let { pageStrokesMap[it] } ?: emptyList()
+    val pageTexts: List<PageTextObject> = currentPageId?.let { pageTextsMap[it] } ?: emptyList()
+    val pageImages: List<PageImageObject> = currentPageId?.let { pageImagesMap[it] } ?: emptyList()
     var activeStrokeState by remember { mutableStateOf<InkStroke?>(null) }
+    var activeStrokePageId by remember { mutableStateOf<String?>(null) }
+
+    fun getStrokes(pageId: String?): List<InkStroke> = if (pageId != null) (pageStrokesMap[pageId] ?: emptyList()) else emptyList()
+    fun getTexts(pageId: String?): List<PageTextObject> = if (pageId != null) (pageTextsMap[pageId] ?: emptyList()) else emptyList()
+    fun getImages(pageId: String?): List<PageImageObject> = if (pageId != null) (pageImagesMap[pageId] ?: emptyList()) else emptyList()
+
+    fun commitPageStrokes(pageId: String, newList: List<InkStroke>) {
+        pageStrokesMap[pageId] = newList
+        loadedPageIds[pageId] = true
+        editorPersistenceScope.launch { repository.savePageStrokes(pageId, newList) }
+    }
+    fun commitPageTexts(pageId: String, newList: List<PageTextObject>) {
+        pageTextsMap[pageId] = newList
+        loadedPageIds[pageId] = true
+        editorPersistenceScope.launch { repository.savePageTexts(pageId, newList) }
+    }
+    fun commitPageImages(pageId: String, newList: List<PageImageObject>, persistNow: Boolean = true) {
+        pageImagesMap[pageId] = newList
+        loadedPageIds[pageId] = true
+        if (persistNow) {
+            editorPersistenceScope.launch { repository.savePageImages(pageId, newList) }
+        }
+    }
 
     // Saved Pen Presets
     var penPresets by remember {
@@ -166,11 +325,14 @@ fun NotebookEditorScreen(
     // Fit Width View Mode (Fits PDF page to device width for reading without side margins)
     var isFitWidth by remember { mutableStateOf(true) }
 
-    // Touch gesture tracking for click vs draw detection
+    // Touch gesture tracking for click vs draw detection & active multi-page interaction
     var touchDownDocX by remember { mutableFloatStateOf(0f) }
     var touchDownDocY by remember { mutableFloatStateOf(0f) }
+    var touchDownScreenX by remember { mutableFloatStateOf(0f) }
+    var touchDownScreenY by remember { mutableFloatStateOf(0f) }
     var touchDownTime by remember { mutableLongStateOf(0L) }
     var potentialTappedImageId by remember { mutableStateOf<String?>(null) }
+    var activeInteractionPageId by remember { mutableStateOf<String?>(null) }
 
     // PDF Reading Guide (Red Line Overlay with trail/fade effect)
     var showReadingGuide by remember { mutableStateOf(false) }
@@ -192,29 +354,21 @@ fun NotebookEditorScreen(
     var activeImageHandle by remember { mutableStateOf(ImageHandleType.NONE) }
     var imageDragStartPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
     var initialImageSnapshot by remember { mutableStateOf<PageImageObject?>(null) }
-    var showImageCropDialog by remember { mutableStateOf(false) }
+    var isCroppingImage by remember { mutableStateOf(false) }
+    // Live crop values used while in interactive canvas crop mode
+    var liveCropLeft by remember { mutableFloatStateOf(0f) }
+    var liveCropTop by remember { mutableFloatStateOf(0f) }
+    var liveCropRight by remember { mutableFloatStateOf(1f) }
+    var liveCropBottom by remember { mutableFloatStateOf(1f) }
     var lastImageTapTime by remember { mutableLongStateOf(0L) }
     var lastTappedImageId by remember { mutableStateOf<String?>(null) }
 
-    // Safe Page Switch Helper: flushes current page state to disk before index change
-    fun navigateToPage(targetIndex: Int) {
-        if (targetIndex < 0 || targetIndex >= pages.size) return
-        val currentP = currentPage
-        if (currentP != null) {
-            val sSnap = currentStrokes
-            val tSnap = pageTexts
-            val iSnap = pageImages
-            coroutineScope.launch {
-                repository.savePageStrokes(currentP.id, sSnap)
-                repository.savePageTexts(currentP.id, tSnap)
-                repository.savePageImages(currentP.id, iSnap)
-            }
-        }
-        currentPageIndex = targetIndex
-        coroutineScope.launch {
-            repository.updateLastOpenedPage(documentId, targetIndex)
-        }
-    }
+    // Laser Pen State (draws glowing fading underline trail right under text lines while reading)
+    var laserColorState by remember { mutableLongStateOf(0xFFEF4444L) }
+    var isLaserUnderlineSnap by remember { mutableStateOf(true) }
+    var laserTrails by remember { mutableStateOf<List<LaserStrokeTrail>>(emptyList()) }
+    var activeLaserTrail by remember { mutableStateOf<LaserStrokeTrail?>(null) }
+    var laserRenderTick by remember { mutableLongStateOf(0L) }
 
     // Text Manipulation State
     var selectedTextId by remember { mutableStateOf<String?>(null) }
@@ -230,6 +384,37 @@ fun NotebookEditorScreen(
     var selectedStrokes by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isDraggingLassoSelection by remember { mutableStateOf(false) }
     var lassoDragLastPoint by remember { mutableStateOf<Pair<Float, Float>?>(null) }
+
+    // Safe Page Switch Helper: clears selection/undo cleanly and optionally resets pan to top of target page
+    fun navigateToPage(targetIndex: Int, resetPan: Boolean = true) {
+        if (targetIndex < 0 || targetIndex >= pages.size) return
+        val prevPage = currentPage
+        if (prevPage != null) {
+            val sSnap = getStrokes(prevPage.id)
+            val tSnap = getTexts(prevPage.id)
+            val iSnap = getImages(prevPage.id)
+            editorPersistenceScope.launch {
+                repository.savePageStrokes(prevPage.id, sSnap)
+                repository.savePageTexts(prevPage.id, tSnap)
+                repository.savePageImages(prevPage.id, iSnap)
+            }
+        }
+        if (targetIndex != currentPageIndex) {
+            inkEngine.clearHistory()
+            selectedStrokes = emptySet()
+            selectedImageId = null
+            selectedTextId = null
+            isCroppingImage = false
+            activeImageHandle = ImageHandleType.NONE
+        }
+        if (resetPan) {
+            panOffset = Offset.Zero
+        }
+        currentPageIndex = targetIndex
+        editorPersistenceScope.launch {
+            repository.updateLastOpenedPage(documentId, targetIndex)
+        }
+    }
 
     // Dialog & Sheet States
     var showPageManagerSheet by remember { mutableStateOf(false) }
@@ -255,9 +440,9 @@ fun NotebookEditorScreen(
                 val success = PdfExporter().exportDocumentToPdf(
                     document = doc,
                     pages = pages,
-                    strokeProvider = { pageId -> repository.loadPageStrokes(pageId) },
-                    imageProvider = { pageId -> repository.loadPageImages(pageId) },
-                    textProvider = { pageId -> repository.loadPageTexts(pageId) },
+                    strokeProvider = { pageId -> pageStrokesMap[pageId] ?: repository.loadPageStrokes(pageId) },
+                    imageProvider = { pageId -> pageImagesMap[pageId] ?: repository.loadPageImages(pageId) },
+                    textProvider = { pageId -> pageTextsMap[pageId] ?: repository.loadPageTexts(pageId) },
                     outputFile = tempPdf
                 )
                 if (success && tempPdf.exists()) {
@@ -278,15 +463,15 @@ fun NotebookEditorScreen(
         }
     }
 
-    // Image Picker Launcher
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
+    // Image Gallery Picker (native Photo Gallery via PickVisualMedia + GetContent universal fallback)
+    var pendingImageTargetPageId by remember { mutableStateOf<String?>(null) }
+    val handleSelectedImageUri: (Uri?) -> Unit = { uri ->
         uri?.let {
             coroutineScope.launch {
                 try {
+                    val targetPid = pendingImageTargetPageId ?: currentPage?.id
+                    val targetPage = pages.find { p -> p.id == targetPid } ?: currentPage ?: return@launch
                     val savedPath = repository.copyImageFromUri(it)
-                    val targetPage = currentPage ?: return@launch
                     val bmp = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(savedPath) }
                     if (bmp != null) {
                         imageBitmaps[savedPath] = bmp
@@ -295,6 +480,7 @@ fun NotebookEditorScreen(
                     val initW = 240f
                     val initH = (initW / aspect).coerceIn(80f, 360f)
 
+                    val existingImgs = getImages(targetPage.id)
                     val newImg = PageImageObject(
                         id = UUID.randomUUID().toString(),
                         pageId = targetPage.id,
@@ -303,16 +489,16 @@ fun NotebookEditorScreen(
                         y = ((targetPage.height - initH) / 2f).coerceAtLeast(20f),
                         width = initW,
                         height = initH,
-                        zIndex = (pageImages.maxOfOrNull { img -> img.zIndex } ?: 0) + 1
+                        zIndex = (existingImgs.maxOfOrNull { img -> img.zIndex } ?: 0) + 1
                     )
-                    val updated = pageImages + newImg
-                    pageImages = updated
+                    val updated = existingImgs + newImg
+                    commitPageImages(targetPage.id, updated)
                     selectedImageId = newImg.id
                     selectedTextId = null
+                    isCroppingImage = false
                     selectTool(ToolType.PAN)
-                    repository.savePageImages(targetPage.id, updated)
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Image inserted — drag handles to resize or rotate", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Image inserted — drag handles, or tap Crop to trim edges", Toast.LENGTH_SHORT).show()
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -320,6 +506,26 @@ fun NotebookEditorScreen(
                         Toast.makeText(context, "Failed to insert image", Toast.LENGTH_SHORT).show()
                     }
                 }
+            }
+        }
+    }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+        onResult = handleSelectedImageUri
+    )
+    val imageGetContentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+        onResult = handleSelectedImageUri
+    )
+    fun launchImageGalleryPicker() {
+        pendingImageTargetPageId = currentPage?.id
+        try {
+            photoPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        } catch (_: Throwable) {
+            try {
+                imageGetContentLauncher.launch("image/*")
+            } catch (_: Throwable) {
+                Toast.makeText(context, "No image picker available on device", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -362,8 +568,8 @@ fun NotebookEditorScreen(
         }
         for (p in pages) {
             val pNum = p.index + 1
-            val texts = if (p.id == currentPage?.id) pageTexts else repository.loadPageTexts(p.id)
-            val strokes = if (p.id == currentPage?.id) currentStrokes else repository.loadPageStrokes(p.id)
+            val texts = if (loadedPageIds[p.id] == true) getTexts(p.id) else repository.loadPageTexts(p.id)
+            val strokes = if (loadedPageIds[p.id] == true) getStrokes(p.id) else repository.loadPageStrokes(p.id)
             for (t in texts) {
                 sb.append("[Page $pNum] ${t.text.trim()}.\n")
             }
@@ -390,69 +596,102 @@ fun NotebookEditorScreen(
         }
     }
 
-    // Track previous page id so we can save before switching
-    var previousPageId by remember { mutableStateOf<String?>(null) }
-
-    // Load strokes, text notes, and images whenever currentPage changes
-    // PART 1 FIX: Save current page data BEFORE loading new page data to prevent image/text loss on navigation
-    LaunchedEffect(currentPage?.id) {
-        val newPageId = currentPage?.id ?: return@LaunchedEffect
-        // Save previous page content before switching away (prevents data loss on page navigation)
-        previousPageId?.let { prevId ->
-            if (prevId != newPageId) {
-                repository.savePageStrokes(prevId, currentStrokes)
-                repository.savePageTexts(prevId, pageTexts)
-                repository.savePageImages(prevId, pageImages)
-            }
-        }
-        previousPageId = newPageId
-        // Load new page content
-        currentStrokes = repository.loadPageStrokes(newPageId)
-        pageTexts = repository.loadPageTexts(newPageId)
-        pageImages = repository.loadPageImages(newPageId)
-        inkEngine.clearHistory()
-        selectedStrokes = emptySet()
-        selectedImageId = null
-        selectedTextId = null
-    }
-
-    // Flush current page on exit
-    DisposableEffect(currentPage?.id) {
-        onDispose {
-            currentPage?.id?.let { pid ->
-                val s = currentStrokes
-                val t = pageTexts
-                val i = pageImages
-                coroutineScope.launch {
-                    repository.savePageStrokes(pid, s)
-                    repository.savePageTexts(pid, t)
-                    repository.savePageImages(pid, i)
-                }
-            }
-        }
-    }
-
-    // Decode bitmaps for any newly loaded images safely on IO and commit to state on Main thread
-    LaunchedEffect(pageImages) {
-        val loaded = withContext(Dispatchers.IO) {
-            pageImages.mapNotNull { img ->
-                if (!imageBitmaps.containsKey(img.filePath)) {
-                    val f = File(img.filePath)
-                    if (f.exists()) {
-                        val bmp = BitmapFactory.decodeFile(f.absolutePath)
-                        if (bmp != null) img.filePath to bmp else null
-                    } else null
-                } else null
-            }
-        }
-        for ((path, bmp) in loaded) {
-            imageBitmaps[path] = bmp
-        }
-    }
-
     // View Mode: Continuous Vertical Scrolling (like standard PDF / Acrobat) vs Single Page Flip
     var isContinuousVerticalScroll by remember { mutableStateOf(true) }
     val pdfBitmaps = remember { mutableStateMapOf<Int, Bitmap>() }
+
+    // Resume last opened page once when document & pages load
+    var hasRestoredLastPage by remember(documentId) { mutableStateOf(false) }
+    LaunchedEffect(document?.id, pages.size) {
+        val doc = document ?: return@LaunchedEffect
+        if (!hasRestoredLastPage && pages.isNotEmpty()) {
+            hasRestoredLastPage = true
+            currentPageIndex = doc.lastOpenedPageIndex.coerceIn(0, pages.size - 1)
+        }
+    }
+
+    // Preload strokes, text notes, and images for ALL currently visible pages (and decode image bitmaps)
+    val visiblePageRange = remember(currentPageIndex, pages, isContinuousVerticalScroll) {
+        if (pages.isEmpty()) emptyList()
+        else if (isContinuousVerticalScroll) {
+            val minIdx = (currentPageIndex - 2).coerceAtLeast(0)
+            val maxIdx = (currentPageIndex + 2).coerceAtMost(pages.size - 1)
+            (minIdx..maxIdx).map { pages[it] }
+        } else {
+            listOfNotNull(pages.getOrNull(currentPageIndex))
+        }
+    }
+
+    LaunchedEffect(visiblePageRange) {
+        val toLoad = visiblePageRange.filter { loadedPageIds[it.id] != true }
+        if (toLoad.isNotEmpty()) {
+            val loadedData = withContext(Dispatchers.IO) {
+                toLoad.map { p ->
+                    Triple(
+                        p.id,
+                        repository.loadPageStrokes(p.id),
+                        Pair(repository.loadPageTexts(p.id), repository.loadPageImages(p.id))
+                    )
+                }
+            }
+            for ((pid, s, ti) in loadedData) {
+                if (loadedPageIds[pid] != true) {
+                    pageStrokesMap[pid] = s
+                    pageTextsMap[pid] = ti.first
+                    pageImagesMap[pid] = ti.second
+                    loadedPageIds[pid] = true
+                }
+            }
+        }
+        // Decode image bitmaps for ALL images on visible pages that aren't cached yet
+        val allVisibleImages = visiblePageRange.flatMap { pageImagesMap[it.id].orEmpty() }
+        val missingPaths = allVisibleImages.map { it.filePath }.distinct().filter { !imageBitmaps.containsKey(it) }
+        if (missingPaths.isNotEmpty()) {
+            val decoded = withContext(Dispatchers.IO) {
+                missingPaths.mapNotNull { path ->
+                    val f = File(path)
+                    if (f.exists()) BitmapFactory.decodeFile(f.absolutePath)?.let { path to it } else null
+                }
+            }
+            for ((path, bmp) in decoded) {
+                imageBitmaps[path] = bmp
+            }
+        }
+    }
+
+    // Flush ALL loaded pages safely via non-cancellable scope when leaving the editor
+    DisposableEffect(documentId) {
+        onDispose {
+            val strokeSnapshot = pageStrokesMap.toMap()
+            val textSnapshot = pageTextsMap.toMap()
+            val imageSnapshot = pageImagesMap.toMap()
+            editorPersistenceScope.launch {
+                strokeSnapshot.forEach { (pid, s) -> repository.savePageStrokes(pid, s) }
+                textSnapshot.forEach { (pid, t) -> repository.savePageTexts(pid, t) }
+                imageSnapshot.forEach { (pid, i) -> repository.savePageImages(pid, i) }
+            }
+        }
+    }
+
+    // Smooth 60fps decay loop while Laser Pen trails are fading out behind the reader
+    LaunchedEffect(laserTrails.isNotEmpty(), activeLaserTrail != null) {
+        while (laserTrails.isNotEmpty() || activeLaserTrail != null) {
+            withFrameNanos { }
+            val nowMs = System.currentTimeMillis()
+            val cutoff = nowMs - 1700L
+            laserTrails = laserTrails.mapNotNull { trail ->
+                val freshPts = trail.points.filter { it.timestampMs >= cutoff }
+                if (freshPts.size >= 2) trail.copy(points = freshPts) else null
+            }
+            activeLaserTrail?.let { active ->
+                val freshPts = active.points.filter { it.timestampMs >= cutoff }
+                if (freshPts.size != active.points.size) {
+                    activeLaserTrail = if (freshPts.isNotEmpty()) active.copy(points = freshPts) else null
+                }
+            }
+            laserRenderTick = nowMs
+        }
+    }
 
     // Synchronize default modes once document metadata loads
     LaunchedEffect(document?.id, document?.type) {
@@ -484,7 +723,7 @@ fun NotebookEditorScreen(
 
             for (idx in pagesToLoad) {
                 if (idx in 0 until pCount && !pdfBitmaps.containsKey(idx)) {
-                    val bmp = renderer.renderPage(idx)
+                    val bmp = renderer.renderPage(idx, targetWidth = 1440, targetHeight = 2040)
                     if (bmp != null) {
                         pdfBitmaps[idx] = bmp
                     }
@@ -543,87 +782,46 @@ fun NotebookEditorScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Left: Back & Title
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = {
-                                currentPage?.id?.let { pid ->
-                                    val s = currentStrokes
-                                    val t = pageTexts
-                                    val i = pageImages
-                                    coroutineScope.launch {
-                                        repository.savePageStrokes(pid, s)
-                                        repository.savePageTexts(pid, t)
-                                        repository.savePageImages(pid, i)
-                                    }
-                                }
-                                onNavigateBack()
-                            }) {
-                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        // Left: Back & Title (fixed, compact so action bar has plenty of room on phones)
+                        IconButton(onClick = {
+                            val strokeSnap = pageStrokesMap.toMap()
+                            val textSnap = pageTextsMap.toMap()
+                            val imgSnap = pageImagesMap.toMap()
+                            editorPersistenceScope.launch {
+                                strokeSnap.forEach { (pid, s) -> repository.savePageStrokes(pid, s) }
+                                textSnap.forEach { (pid, t) -> repository.savePageTexts(pid, t) }
+                                imgSnap.forEach { (pid, i) -> repository.savePageImages(pid, i) }
                             }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = document?.title ?: "Note",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1
-                                )
-                                Text(
-                                    text = "Saved locally · ${currentStrokes.size} strokes",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.secondary
-                                )
-                            }
+                            onNavigateBack()
+                        }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                        Column(modifier = Modifier.widthIn(max = 130.dp).padding(end = 6.dp)) {
+                            Text(
+                                text = document?.title ?: "Note",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                            Text(
+                                text = "${currentStrokes.size} strokes · ${pageImages.size} img",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary,
+                                maxLines = 1
+                            )
                         }
 
-                        // Center: Page Navigator & Audio Bar
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (recordingState == RecordingState.RECORDING) {
-                                Button(
-                                    onClick = { audioRecorder.stopRecording() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                    shape = RoundedCornerShape(20.dp),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    val sec = (recordingDurationMs / 1000) % 60
-                                    val min = (recordingDurationMs / 1000) / 60
-                                    Text(String.format(Locale.ROOT, "%02d:%02d", min, sec), fontSize = 12.sp)
-                                }
-                            } else {
-                                val audioFile = File(context.filesDir, "audio/${documentId}.m4a")
-                                if (audioFile.exists()) {
-                                    IconButton(
-                                        onClick = {
-                                            if (isAudioPlaying) audioPlayer.pause() else audioPlayer.play(audioFile)
-                                        }
-                                    ) {
-                                        Icon(
-                                            imageVector = if (isAudioPlaying) Icons.Default.PauseCircle else Icons.Default.PlayCircle,
-                                            contentDescription = "Play Audio",
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(26.dp)
-                                        )
-                                    }
-                                }
-                                IconButton(
-                                    onClick = { audioRecorder.startRecording(documentId) }
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Mic,
-                                        contentDescription = "Record Audio",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-
-                            VerticalDivider(modifier = Modifier.height(24.dp))
-
+                        // Scrollable Action Strip: guarantees ALL buttons are reachable on both phones & tablets
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
                             IconButton(
                                 enabled = currentPageIndex > 0,
                                 onClick = { navigateToPage(currentPageIndex - 1) }
@@ -635,15 +833,15 @@ fun NotebookEditorScreen(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
                                     .clickable { showPageManagerSheet = true }
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
                                 color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.GridView, contentDescription = null, modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = "${currentPageIndex + 1} / ${pages.size.coerceAtLeast(1)}",
-                                        style = MaterialTheme.typography.titleMedium,
+                                        text = "${currentPageIndex + 1}/${pages.size.coerceAtLeast(1)}",
+                                        style = MaterialTheme.typography.titleSmall,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.primary
                                     )
@@ -655,6 +853,48 @@ fun NotebookEditorScreen(
                                 onClick = { navigateToPage(currentPageIndex + 1) }
                             ) {
                                 Icon(Icons.Default.ChevronRight, contentDescription = "Next Page")
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    insertPageTargetIndex = currentPageIndex
+                                    insertPagePositionMode = "AFTER"
+                                    insertPageSelectedTemplate = currentPage?.template ?: PageTemplate.RULED
+                                    showInsertPageDialog = true
+                                }
+                            ) {
+                                Icon(Icons.Default.AddCircleOutline, contentDescription = "Insert Page Here")
+                            }
+
+                            // Laser Pen Toggle (draw fading underline under text lines as you read)
+                            val isLaserSelected = activeToolState == ToolType.LASER
+                            IconButton(
+                                onClick = {
+                                    if (isLaserSelected) selectTool(ToolType.PEN) else selectTool(ToolType.LASER)
+                                },
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (isLaserSelected) Color(0x28EF4444) else Color.Transparent)
+                            ) {
+                                Icon(
+                                    Icons.Default.Flare,
+                                    contentDescription = "Laser Reading Pen",
+                                    tint = if (isLaserSelected) Color(0xFFEF4444) else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            // PDF Reading Guide Toggle (Red Border / White Center Line)
+                            IconButton(
+                                onClick = { showReadingGuide = !showReadingGuide },
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (showReadingGuide) Color(0x22DC2626) else Color.Transparent)
+                            ) {
+                                Icon(
+                                    Icons.Default.HorizontalRule,
+                                    contentDescription = "Toggle Reading Guide",
+                                    tint = if (showReadingGuide) Color(0xFFDC2626) else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
 
                             // View Mode: Fit Width vs Fit Page
@@ -680,6 +920,7 @@ fun NotebookEditorScreen(
                             IconButton(
                                 onClick = {
                                     isContinuousVerticalScroll = !isContinuousVerticalScroll
+                                    panOffset = Offset.Zero
                                     Toast.makeText(
                                         context,
                                         if (isContinuousVerticalScroll) "Vertical Scrolling View (Standard PDF)" else "Single Page View",
@@ -698,20 +939,6 @@ fun NotebookEditorScreen(
                             }
 
                             IconButton(
-                                onClick = {
-                                    insertPageTargetIndex = currentPageIndex
-                                    insertPagePositionMode = "AFTER"
-                                    insertPageSelectedTemplate = currentPage?.template ?: PageTemplate.RULED
-                                    showInsertPageDialog = true
-                                }
-                            ) {
-                                Icon(Icons.Default.AddCircleOutline, contentDescription = "Insert Page Here")
-                            }
-                        }
-
-                        // Right: Ruler toggle, PDF Export, & Ask InkFlow
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            IconButton(
                                 onClick = { showRuler = !showRuler },
                                 modifier = Modifier
                                     .clip(CircleShape)
@@ -724,18 +951,46 @@ fun NotebookEditorScreen(
                                 )
                             }
 
-                            // PDF Reading Guide Toggle (Red Line Overlay for tracking reading position)
-                            IconButton(
-                                onClick = { showReadingGuide = !showReadingGuide },
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .background(if (showReadingGuide) Color(0x22DC2626) else Color.Transparent)
-                            ) {
-                                Icon(
-                                    Icons.Default.HorizontalRule,
-                                    contentDescription = "Toggle Reading Guide",
-                                    tint = if (showReadingGuide) Color(0xFFDC2626) else MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+                            VerticalDivider(modifier = Modifier.height(22.dp).padding(horizontal = 2.dp))
+
+                            if (recordingState == RecordingState.RECORDING) {
+                                Button(
+                                    onClick = { audioRecorder.stopRecording() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                    shape = RoundedCornerShape(20.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    val sec = (recordingDurationMs / 1000) % 60
+                                    val min = (recordingDurationMs / 1000) / 60
+                                    Text(String.format(Locale.ROOT, "%02d:%02d", min, sec), fontSize = 12.sp)
+                                }
+                            } else {
+                                val audioFile = File(context.filesDir, "audio/${documentId}.m4a")
+                                if (audioFile.exists()) {
+                                    IconButton(
+                                        onClick = {
+                                            if (isAudioPlaying) audioPlayer.pause() else audioPlayer.play(audioFile)
+                                        }
+                                    ) {
+                                        Icon(
+                                            imageVector = if (isAudioPlaying) Icons.Default.PauseCircle else Icons.Default.PlayCircle,
+                                            contentDescription = "Play Audio",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
+                                }
+                                IconButton(
+                                    onClick = { audioRecorder.startRecording(documentId) }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Mic,
+                                        contentDescription = "Record Audio",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
 
                             IconButton(onClick = { showExportDialog = true }) {
@@ -744,11 +999,12 @@ fun NotebookEditorScreen(
 
                             FilledTonalButton(
                                 onClick = { showAiPanel = !showAiPanel },
-                                shape = RoundedCornerShape(12.dp)
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                             ) {
                                 Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Ask InkFlow", fontSize = 13.sp)
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Ask InkFlow", fontSize = 12.sp)
                             }
                         }
                     }
@@ -774,8 +1030,53 @@ fun NotebookEditorScreen(
 
                 val totalScale = baseScale * zoomScale
 
-                val originX = if (isFitWidth) 0f else (availableW - pageW * totalScale) / 2f
+                val originX = if (isFitWidth) ((availableW - pageW * totalScale) / 2f).coerceAtLeast(0f) else (availableW - pageW * totalScale) / 2f
                 val originY = if (isContinuousVerticalScroll) 16f else (availableH - pageH * totalScale) / 2f
+                val pageGapPx = 24f
+
+                fun getPageYOffset(targetIdx: Int): Float {
+                    if (!isContinuousVerticalScroll || pages.isEmpty() || targetIdx == currentPageIndex) return 0f
+                    var y = 0f
+                    if (targetIdx > currentPageIndex) {
+                        for (i in currentPageIndex until targetIdx) {
+                            y += (pages.getOrNull(i)?.height ?: pageH) + pageGapPx
+                        }
+                    } else {
+                        for (i in targetIdx until currentPageIndex) {
+                            y -= (pages.getOrNull(i)?.height ?: pageH) + pageGapPx
+                        }
+                    }
+                    return y
+                }
+
+                fun findTouchedPageIndex(rawDocY: Float): Int {
+                    if (!isContinuousVerticalScroll || pages.size <= 1) {
+                        return currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                    }
+                    if (rawDocY >= 0f) {
+                        var top = 0f
+                        for (i in currentPageIndex until pages.size) {
+                            val h = pages[i].height + pageGapPx
+                            if (rawDocY < top + h || i == pages.lastIndex) return i
+                            top += h
+                        }
+                        return pages.lastIndex
+                    } else {
+                        var top = 0f
+                        for (i in (currentPageIndex - 1) downTo 0) {
+                            val h = pages[i].height + pageGapPx
+                            top -= h
+                            if (rawDocY >= top || i == 0) return i
+                        }
+                        return 0
+                    }
+                }
+
+                fun getInteractOffsetY(pageId: String?): Float {
+                    if (!isContinuousVerticalScroll || pages.size <= 1 || pageId == null) return 0f
+                    val idx = pages.indexOfFirst { it.id == pageId }
+                    return if (idx >= 0) getPageYOffset(idx) else 0f
+                }
 
                 Box(
                     modifier = Modifier
@@ -797,6 +1098,8 @@ fun NotebookEditorScreen(
                                         lastPinchMid = mid
                                         inkEngine.cancelStroke()
                                         activeStrokeState = null
+                                        activeStrokePageId = null
+                                        activeLaserTrail = null
                                         shapeStartPoint = null
                                         shapeCurrentPoint = null
                                     }
@@ -809,14 +1112,14 @@ fun NotebookEditorScreen(
                                             lastPinchMid = mid
 
                                             if (isContinuousVerticalScroll && pages.size > 1) {
-                                                val pageGap = 24f
-                                                val pageTotalH = (pageH + pageGap) * totalScale
-                                                if (panOffset.y < -pageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
-                                                    navigateToPage(currentPageIndex + 1)
-                                                    panOffset = panOffset.copy(y = panOffset.y + pageTotalH)
-                                                } else if (panOffset.y > pageTotalH * 0.5f && currentPageIndex > 0) {
-                                                    navigateToPage(currentPageIndex - 1)
-                                                    panOffset = panOffset.copy(y = panOffset.y - pageTotalH)
+                                                val curPageTotalH = ((currentPage?.height ?: pageH) + pageGapPx) * totalScale
+                                                if (panOffset.y < -curPageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
+                                                    panOffset = panOffset.copy(y = panOffset.y + curPageTotalH)
+                                                    navigateToPage(currentPageIndex + 1, resetPan = false)
+                                                } else if (panOffset.y > curPageTotalH * 0.5f && currentPageIndex > 0) {
+                                                    val prevTotalH = ((pages[currentPageIndex - 1].height) + pageGapPx) * totalScale
+                                                    panOffset = panOffset.copy(y = panOffset.y - prevTotalH)
+                                                    navigateToPage(currentPageIndex - 1, resetPan = false)
                                                 }
                                             }
                                         }
@@ -853,22 +1156,47 @@ fun NotebookEditorScreen(
                                 touchX, touchY, originX, originY, panOffset.x, panOffset.y, totalScale
                             )
 
+                            val touchedPageIndex = findTouchedPageIndex(rawDocY)
+                            val touchedPage = pages.getOrNull(touchedPageIndex) ?: currentPage
+                            val touchedPageW = touchedPage?.width ?: pageW
+                            val touchedPageH = touchedPage?.height ?: pageH
+                            val touchedPageStartY = getPageYOffset(touchedPageIndex)
+
+                            val localUnclampedX = rawDocX
+                            val localUnclampedY = if (isContinuousVerticalScroll && pages.size > 1) {
+                                rawDocY - touchedPageStartY
+                            } else {
+                                rawDocY
+                            }
+                            val annotDocX = if (isContinuousVerticalScroll && pages.size > 1) {
+                                localUnclampedX.coerceIn(0f, touchedPageW)
+                            } else {
+                                rawDocX
+                            }
+                            val annotDocY = if (isContinuousVerticalScroll && pages.size > 1) {
+                                localUnclampedY.coerceIn(0f, touchedPageH)
+                            } else {
+                                rawDocY
+                            }
+
                             val effectiveTool = if (isStylusEraser) ToolType.ERASER_STROKE else activeToolState
 
                             when (motionEvent.actionMasked) {
                                 MotionEvent.ACTION_DOWN -> {
-                                    // A0. Check if user tapped/dragged the Reading Guide line
+                                    touchDownScreenX = touchX
+                                    touchDownScreenY = touchY
+                                    touchDownTime = System.currentTimeMillis()
+
+                                    // A0. Check if user tapped/dragged the Reading Guide line (global to current viewport)
                                     if (showReadingGuide) {
-                                        val guideHitZone = 20f / totalScale
+                                        val guideHitZone = 22f / totalScale
                                         if (abs(rawDocY - readingGuideY) <= guideHitZone) {
                                             val nowMs = System.currentTimeMillis()
                                             val doubleTap = nowMs - readingGuideLastTapTime < 350L
                                             readingGuideLastTapTime = nowMs
                                             if (doubleTap) {
-                                                // Double-tap: hide the guide
                                                 showReadingGuide = false
                                             } else {
-                                                // Single tap/drag: start dragging
                                                 isDraggingReadingGuide = true
                                             }
                                             return@pointerInteropFilter true
@@ -886,54 +1214,113 @@ fun NotebookEditorScreen(
                                         val relY = rawDocY - rulerY
                                         val along = relX * dirX + relY * dirY
                                         val perp = relX * normX + relY * normY
-                                        if (abs(along) <= 180f && abs(perp) <= 14f) {
+                                        if (abs(along) <= 200f && abs(perp) <= 18f) {
                                             isDraggingRuler = true
                                             rulerDragStart = Pair(rawDocX - rulerX, rawDocY - rulerY)
                                             return@pointerInteropFilter true
                                         }
                                     }
 
-                                    // B. Check Selected Image Handles (All 4 corners, top rotate knob, and body move)
-                                    if (selectedImage != null && !selectedImage.isLocked) {
-                                        val img = selectedImage
-                                        val hitR = 32f / totalScale
+                                    // Page switch in continuous scroll: keep visual position locked with zero jump
+                                    if (isContinuousVerticalScroll && touchedPageIndex != currentPageIndex && touchedPageIndex in pages.indices) {
+                                        panOffset = panOffset.copy(y = panOffset.y + touchedPageStartY * totalScale)
+                                        navigateToPage(touchedPageIndex, resetPan = false)
+                                    }
+
+                                    val activePid = touchedPage?.id
+                                    activeInteractionPageId = activePid
+                                    val activeImages = getImages(activePid)
+                                    val activeTexts = getTexts(activePid)
+                                    val activeStrokes = getStrokes(activePid)
+
+                                    // B. Check Selected Image Handles (Real 8-handle interactive Crop + 4 Resize Corners + Rotate + Move)
+                                    val curSelectedImage = activeImages.find { it.id == selectedImageId }
+                                    if (curSelectedImage != null && !curSelectedImage.isLocked) {
+                                        val img = curSelectedImage
+                                        val hitR = 34f / totalScale
+
+                                        // B1. Interactive Canvas Crop Handles (4 corners + 4 edges)
+                                        if (isCroppingImage) {
+                                            val frame = computeUncroppedFrame(img)
+                                            val (rotX, rotY) = inverseRotatePoint(localUnclampedX, localUnclampedY, frame.centerX, frame.centerY, img.rotationDegrees)
+                                            val cropLocalX = if (img.isFlippedHorizontal) 2f * frame.centerX - rotX else rotX
+                                            val cropLocalY = if (img.isFlippedVertical) 2f * frame.centerY - rotY else rotY
+
+                                            val cropHitR = 34f / totalScale
+                                            val cropL = frame.fullX + liveCropLeft * frame.fullW
+                                            val cropR = frame.fullX + liveCropRight * frame.fullW
+                                            val cropT = frame.fullY + liveCropTop * frame.fullH
+                                            val cropB = frame.fullY + liveCropBottom * frame.fullH
+                                            val midX = (cropL + cropR) / 2f
+                                            val midY = (cropT + cropB) / 2f
+
+                                            val matchedCropHandle = when {
+                                                hypot(cropLocalX - cropL, cropLocalY - cropT) < cropHitR -> ImageHandleType.CROP_TOP_LEFT
+                                                hypot(cropLocalX - cropR, cropLocalY - cropT) < cropHitR -> ImageHandleType.CROP_TOP_RIGHT
+                                                hypot(cropLocalX - cropL, cropLocalY - cropB) < cropHitR -> ImageHandleType.CROP_BOTTOM_LEFT
+                                                hypot(cropLocalX - cropR, cropLocalY - cropB) < cropHitR -> ImageHandleType.CROP_BOTTOM_RIGHT
+                                                hypot(cropLocalX - cropL, cropLocalY - midY) < cropHitR -> ImageHandleType.CROP_LEFT
+                                                hypot(cropLocalX - cropR, cropLocalY - midY) < cropHitR -> ImageHandleType.CROP_RIGHT
+                                                hypot(cropLocalX - midX, cropLocalY - cropT) < cropHitR -> ImageHandleType.CROP_TOP
+                                                hypot(cropLocalX - midX, cropLocalY - cropB) < cropHitR -> ImageHandleType.CROP_BOTTOM
+                                                else -> ImageHandleType.NONE
+                                            }
+                                            if (matchedCropHandle != ImageHandleType.NONE) {
+                                                activeImageHandle = matchedCropHandle
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
+                                                initialImageSnapshot = img
+                                                return@pointerInteropFilter true
+                                            }
+
+                                            // Absorb touch inside full uncropped bounds so accidental strokes don't trigger during crop
+                                            if (cropLocalX in (frame.fullX - 16f / totalScale)..(frame.fullX + frame.fullW + 16f / totalScale) &&
+                                                cropLocalY in (frame.fullY - 16f / totalScale)..(frame.fullY + frame.fullH + 16f / totalScale)
+                                            ) {
+                                                return@pointerInteropFilter true
+                                            }
+                                            isCroppingImage = false
+                                        }
+
+                                        val cx = img.x + img.width / 2f
+                                        val cy = img.y + img.height / 2f
+                                        val (localRotX, localRotY) = inverseRotatePoint(localUnclampedX, localUnclampedY, cx, cy, img.rotationDegrees)
                                         val rotKnobX = img.x + img.width / 2f
                                         val rotKnobY = img.y - 22f / totalScale
 
                                         when {
-                                            hypot(rawDocX - rotKnobX, rawDocY - rotKnobY) < hitR -> {
+                                            hypot(localRotX - rotKnobX, localRotY - rotKnobY) < hitR -> {
                                                 activeImageHandle = ImageHandleType.ROTATE
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
-                                            hypot(rawDocX - (img.x + img.width), rawDocY - (img.y + img.height)) < hitR -> {
+                                            hypot(localRotX - (img.x + img.width), localRotY - (img.y + img.height)) < hitR -> {
                                                 activeImageHandle = ImageHandleType.BOTTOM_RIGHT
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
-                                            hypot(rawDocX - img.x, rawDocY - img.y) < hitR -> {
+                                            hypot(localRotX - img.x, localRotY - img.y) < hitR -> {
                                                 activeImageHandle = ImageHandleType.TOP_LEFT
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
-                                            hypot(rawDocX - (img.x + img.width), rawDocY - img.y) < hitR -> {
+                                            hypot(localRotX - (img.x + img.width), localRotY - img.y) < hitR -> {
                                                 activeImageHandle = ImageHandleType.TOP_RIGHT
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
-                                            hypot(rawDocX - img.x, rawDocY - (img.y + img.height)) < hitR -> {
+                                            hypot(localRotX - img.x, localRotY - (img.y + img.height)) < hitR -> {
                                                 activeImageHandle = ImageHandleType.BOTTOM_LEFT
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
-                                            rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height) -> {
+                                            localRotX in img.x..(img.x + img.width) && localRotY in img.y..(img.y + img.height) -> {
                                                 activeImageHandle = ImageHandleType.MOVE
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = img
                                                 return@pointerInteropFilter true
                                             }
@@ -941,14 +1328,15 @@ fun NotebookEditorScreen(
                                     }
 
                                     // C. Check Selected Text Object Drag
-                                    if (selectedText != null) {
-                                        val txt = selectedText
+                                    val curSelectedText = activeTexts.find { it.id == selectedTextId }
+                                    if (curSelectedText != null) {
+                                        val txt = curSelectedText
                                         val lines = txt.text.split("\n")
                                         val boxW = ((lines.maxOfOrNull { it.length } ?: 4) * txt.fontSizeSp * 0.6f + 24f).coerceAtLeast(70f)
                                         val boxH = lines.size * txt.fontSizeSp * 1.4f + 16f
-                                        if (rawDocX in (txt.x - 8f)..(txt.x + boxW) && rawDocY in (txt.y - 6f)..(txt.y + boxH)) {
+                                        if (localUnclampedX in (txt.x - 8f)..(txt.x + boxW) && localUnclampedY in (txt.y - 6f)..(txt.y + boxH)) {
                                             isDraggingText = true
-                                            textDragStartPoint = Pair(rawDocX, rawDocY)
+                                            textDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                             initialTextPos = Pair(txt.x, txt.y)
                                             return@pointerInteropFilter true
                                         }
@@ -956,25 +1344,24 @@ fun NotebookEditorScreen(
 
                                     // D. Check Dragging Inside Lasso Selection Bounds
                                     if (selectedStrokes.isNotEmpty()) {
-                                        val selBounds = inkEngine.getSelectionBounds(currentStrokes)
+                                        val selBounds = inkEngine.getSelectionBounds(activeStrokes)
                                         if (selBounds != null &&
-                                            rawDocX in (selBounds.left - 12f)..(selBounds.right + 12f) &&
-                                            rawDocY in (selBounds.top - 12f)..(selBounds.bottom + 12f)
+                                            localUnclampedX in (selBounds.left - 12f)..(selBounds.right + 12f) &&
+                                            localUnclampedY in (selBounds.top - 12f)..(selBounds.bottom + 12f)
                                         ) {
                                             isDraggingLassoSelection = true
-                                            lassoDragLastPoint = Pair(rawDocX, rawDocY)
+                                            lassoDragLastPoint = Pair(localUnclampedX, localUnclampedY)
                                             return@pointerInteropFilter true
                                         }
                                     }
 
                                     // Track touch down for tap gesture recognition
-                                    touchDownDocX = rawDocX
-                                    touchDownDocY = rawDocY
-                                    touchDownTime = System.currentTimeMillis()
+                                    touchDownDocX = localUnclampedX
+                                    touchDownDocY = localUnclampedY
 
-                                    // E. Tap to select an Image or Text Object
-                                    val tappedImg = pageImages.sortedBy { it.zIndex }.lastOrNull { img ->
-                                        rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
+                                    // E. Tap to select an Image or Text Object (works accurately even on rotated or cropped images)
+                                    val tappedImg = activeImages.sortedBy { it.zIndex }.lastOrNull { img ->
+                                        isPointInsideImage(localUnclampedX, localUnclampedY, img, pad = 10f / totalScale)
                                     }
                                     potentialTappedImageId = tappedImg?.id
                                     val now = System.currentTimeMillis()
@@ -985,17 +1372,18 @@ fun NotebookEditorScreen(
                                     }
 
                                     if (effectiveTool == ToolType.PAN || effectiveTool == ToolType.LASSO || effectiveTool == ToolType.TEXT || isImageDoubleTap) {
-                                        val tappedText = pageTexts.lastOrNull { txt ->
+                                        val tappedText = activeTexts.lastOrNull { txt ->
                                             val lines = txt.text.split("\n")
                                             val boxW = ((lines.maxOfOrNull { it.length } ?: 4) * txt.fontSizeSp * 0.6f + 24f).coerceAtLeast(70f)
                                             val boxH = lines.size * txt.fontSizeSp * 1.4f + 16f
-                                            rawDocX in (txt.x - 8f)..(txt.x + boxW) && rawDocY in (txt.y - 6f)..(txt.y + boxH)
+                                            localUnclampedX in (txt.x - 8f)..(txt.x + boxW) && localUnclampedY in (txt.y - 6f)..(txt.y + boxH)
                                         }
                                         if (tappedText != null) {
                                             selectedTextId = tappedText.id
                                             selectedImageId = null
+                                            isCroppingImage = false
                                             isDraggingText = true
-                                            textDragStartPoint = Pair(rawDocX, rawDocY)
+                                            textDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                             initialTextPos = Pair(tappedText.x, tappedText.y)
                                             return@pointerInteropFilter true
                                         }
@@ -1003,42 +1391,51 @@ fun NotebookEditorScreen(
                                         if (tappedImg != null) {
                                             selectedImageId = tappedImg.id
                                             selectedTextId = null
+                                            isCroppingImage = false
                                             if (!tappedImg.isLocked) {
                                                 activeImageHandle = ImageHandleType.MOVE
-                                                imageDragStartPoint = Pair(rawDocX, rawDocY)
+                                                imageDragStartPoint = Pair(localUnclampedX, localUnclampedY)
                                                 initialImageSnapshot = tappedImg
                                             }
                                             return@pointerInteropFilter true
                                         }
                                     }
 
-                                    val (docX, docY) = snapPointToRulerIfNear(rawDocX, rawDocY)
+                                    val (docX, docY) = snapPointToRulerIfNear(annotDocX, annotDocY)
 
                                     when (effectiveTool) {
+                                        ToolType.LASER -> {
+                                            selectedImageId = null
+                                            selectedTextId = null
+                                            isCroppingImage = false
+                                            val pid = activePid ?: ""
+                                            activeLaserTrail = LaserStrokeTrail(
+                                                id = UUID.randomUUID().toString(),
+                                                pageId = pid,
+                                                color = laserColorState,
+                                                points = listOf(LaserPoint(annotDocX, annotDocY, System.currentTimeMillis()))
+                                            )
+                                        }
                                         ToolType.ERASER_STROKE -> {
-                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, currentStrokes)
-                                            currentStrokes = remaining
-                                            coroutineScope.launch {
-                                                currentPage?.id?.let { repository.savePageStrokes(it, remaining) }
-                                            }
+                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, activeStrokes)
+                                            if (activePid != null) commitPageStrokes(activePid, remaining)
                                         }
                                         ToolType.ERASER_PIXEL -> {
-                                            val remaining = inkEngine.erasePartialAt(docX, docY, 16f / totalScale, currentStrokes)
-                                            currentStrokes = remaining
-                                            coroutineScope.launch {
-                                                currentPage?.id?.let { repository.savePageStrokes(it, remaining) }
-                                            }
+                                            val remaining = inkEngine.erasePartialAt(docX, docY, 16f / totalScale, activeStrokes)
+                                            if (activePid != null) commitPageStrokes(activePid, remaining)
                                         }
                                         ToolType.LASSO -> {
                                             selectedImageId = null
                                             selectedTextId = null
+                                            isCroppingImage = false
                                             isLassoActive = true
-                                            lassoPoints = listOf(Pair(rawDocX, rawDocY))
+                                            lassoPoints = listOf(Pair(annotDocX, annotDocY))
                                         }
                                         ToolType.TEXT -> {
                                             selectedImageId = null
                                             selectedTextId = null
-                                            pendingTextInsertDocCoords = Pair(rawDocX.coerceIn(16f, pageW - 120f), rawDocY.coerceIn(16f, pageH - 40f))
+                                            isCroppingImage = false
+                                            pendingTextInsertDocCoords = Pair(annotDocX.coerceIn(16f, (touchedPageW - 120f).coerceAtLeast(16f)), annotDocY.coerceIn(16f, (touchedPageH - 40f).coerceAtLeast(16f)))
                                             insertedTextContent = ""
                                             editingTextObject = null
                                             showInsertTextDialog = true
@@ -1046,21 +1443,25 @@ fun NotebookEditorScreen(
                                         ToolType.SHAPE -> {
                                             selectedImageId = null
                                             selectedTextId = null
-                                            shapeStartPoint = Pair(rawDocX, rawDocY)
-                                            shapeCurrentPoint = Pair(rawDocX, rawDocY)
+                                            isCroppingImage = false
+                                            shapeStartPoint = Pair(annotDocX, annotDocY)
+                                            shapeCurrentPoint = Pair(annotDocX, annotDocY)
                                         }
                                         ToolType.PAN -> {
                                             selectedImageId = null
                                             selectedTextId = null
+                                            isCroppingImage = false
                                             imageDragStartPoint = Pair(touchX, touchY)
                                         }
                                         else -> {
                                             selectedImageId = null
                                             selectedTextId = null
+                                            isCroppingImage = false
                                             val currentAudioTime = if (recordingState == RecordingState.RECORDING) {
                                                 audioRecorder.currentTimestampMs
                                             } else null
 
+                                            activeStrokePageId = activePid
                                             inkEngine.startStroke(docX, docY, pressure, currentAudioTime)
                                             activeStrokeState = inkEngine.activeStroke
                                         }
@@ -1075,25 +1476,96 @@ fun NotebookEditorScreen(
                                         return@pointerInteropFilter true
                                     }
 
-                                    // Reading guide drag: move the line to finger position (record trail)
                                     if (isDraggingReadingGuide) {
                                         val newY = rawDocY.coerceIn(10f, pageH - 10f)
                                         if (abs(newY - readingGuideY) > 4f) {
-                                            // Prepend old position to trail, keep last 7 ghost positions
                                             readingGuideTrail = (listOf(readingGuideY) + readingGuideTrail).take(7)
                                         }
                                         readingGuideY = newY
                                         return@pointerInteropFilter true
                                     }
 
-                                    if (activeImageHandle != ImageHandleType.NONE && selectedImage != null && initialImageSnapshot != null && imageDragStartPoint != null) {
+                                    val interactPid = activeInteractionPageId ?: activeStrokePageId ?: currentPageId
+                                    val interactPage = pages.find { it.id == interactPid } ?: currentPage
+                                    val interactW = interactPage?.width ?: pageW
+                                    val interactH = interactPage?.height ?: pageH
+                                    val interactOffsetY = getInteractOffsetY(interactPid)
+
+                                    val moveUnclampedX = rawDocX
+                                    val moveUnclampedY = if (isContinuousVerticalScroll && pages.size > 1) {
+                                        rawDocY - interactOffsetY
+                                    } else {
+                                        rawDocY
+                                    }
+                                    val moveDocX = if (isContinuousVerticalScroll && pages.size > 1) moveUnclampedX.coerceIn(0f, interactW) else moveUnclampedX
+                                    val moveDocY = if (isContinuousVerticalScroll && pages.size > 1) moveUnclampedY.coerceIn(0f, interactH) else moveUnclampedY
+
+                                    if (activeImageHandle != ImageHandleType.NONE && initialImageSnapshot != null && imageDragStartPoint != null) {
                                         val snap = initialImageSnapshot!!
-                                        val dx = rawDocX - imageDragStartPoint!!.first
-                                        val dy = rawDocY - imageDragStartPoint!!.second
+
+                                        // Interactive Crop handle dragging (4 corners + 4 edges)
+                                        if (isCroppingImage && activeImageHandle in listOf(
+                                                ImageHandleType.CROP_LEFT, ImageHandleType.CROP_RIGHT,
+                                                ImageHandleType.CROP_TOP, ImageHandleType.CROP_BOTTOM,
+                                                ImageHandleType.CROP_TOP_LEFT, ImageHandleType.CROP_TOP_RIGHT,
+                                                ImageHandleType.CROP_BOTTOM_LEFT, ImageHandleType.CROP_BOTTOM_RIGHT
+                                            )
+                                        ) {
+                                            val frame = computeUncroppedFrame(snap)
+                                            val (rotX, rotY) = inverseRotatePoint(moveUnclampedX, moveUnclampedY, frame.centerX, frame.centerY, snap.rotationDegrees)
+                                            val localX = if (snap.isFlippedHorizontal) 2f * frame.centerX - rotX else rotX
+                                            val localY = if (snap.isFlippedVertical) 2f * frame.centerY - rotY else rotY
+
+                                            val fx = ((localX - frame.fullX) / frame.fullW)
+                                            val fy = ((localY - frame.fullY) / frame.fullH)
+                                            when (activeImageHandle) {
+                                                ImageHandleType.CROP_LEFT -> {
+                                                    liveCropLeft = fx.coerceIn(0f, liveCropRight - 0.06f)
+                                                }
+                                                ImageHandleType.CROP_RIGHT -> {
+                                                    liveCropRight = fx.coerceIn(liveCropLeft + 0.06f, 1f)
+                                                }
+                                                ImageHandleType.CROP_TOP -> {
+                                                    liveCropTop = fy.coerceIn(0f, liveCropBottom - 0.06f)
+                                                }
+                                                ImageHandleType.CROP_BOTTOM -> {
+                                                    liveCropBottom = fy.coerceIn(liveCropTop + 0.06f, 1f)
+                                                }
+                                                ImageHandleType.CROP_TOP_LEFT -> {
+                                                    liveCropLeft = fx.coerceIn(0f, liveCropRight - 0.06f)
+                                                    liveCropTop = fy.coerceIn(0f, liveCropBottom - 0.06f)
+                                                }
+                                                ImageHandleType.CROP_TOP_RIGHT -> {
+                                                    liveCropRight = fx.coerceIn(liveCropLeft + 0.06f, 1f)
+                                                    liveCropTop = fy.coerceIn(0f, liveCropBottom - 0.06f)
+                                                }
+                                                ImageHandleType.CROP_BOTTOM_LEFT -> {
+                                                    liveCropLeft = fx.coerceIn(0f, liveCropRight - 0.06f)
+                                                    liveCropBottom = fy.coerceIn(liveCropTop + 0.06f, 1f)
+                                                }
+                                                ImageHandleType.CROP_BOTTOM_RIGHT -> {
+                                                    liveCropRight = fx.coerceIn(liveCropLeft + 0.06f, 1f)
+                                                    liveCropBottom = fy.coerceIn(liveCropTop + 0.06f, 1f)
+                                                }
+                                                else -> {}
+                                            }
+                                            return@pointerInteropFilter true
+                                        }
+
+                                        val dxRaw = moveUnclampedX - imageDragStartPoint!!.first
+                                        val dyRaw = moveUnclampedY - imageDragStartPoint!!.second
+                                        val (dx, dy) = if (snap.rotationDegrees != 0f && activeImageHandle != ImageHandleType.MOVE && activeImageHandle != ImageHandleType.ROTATE) {
+                                            val rad = Math.toRadians(-snap.rotationDegrees.toDouble())
+                                            val cosA = cos(rad).toFloat()
+                                            val sinA = sin(rad).toFloat()
+                                            Pair(dxRaw * cosA - dyRaw * sinA, dxRaw * sinA + dyRaw * cosA)
+                                        } else {
+                                            Pair(dxRaw, dyRaw)
+                                        }
                                         val aspect = if (snap.height > 0f) snap.width / snap.height else 1f
 
                                         val updatedImg = when (activeImageHandle) {
-                                            ImageHandleType.MOVE -> snap.copy(x = snap.x + dx, y = snap.y + dy)
+                                            ImageHandleType.MOVE -> snap.copy(x = snap.x + dxRaw, y = snap.y + dyRaw)
                                             ImageHandleType.BOTTOM_RIGHT -> {
                                                 val newW = (snap.width + dx).coerceAtLeast(48f)
                                                 val newH = if (snap.aspectRatioLocked) (newW / aspect).coerceAtLeast(48f) else (snap.height + dy).coerceAtLeast(48f)
@@ -1130,55 +1602,91 @@ fun NotebookEditorScreen(
                                             ImageHandleType.ROTATE -> {
                                                 val cx = snap.x + snap.width / 2f
                                                 val cy = snap.y + snap.height / 2f
-                                                val angleRad = atan2(rawDocY - cy, rawDocX - cx)
+                                                val angleRad = atan2(moveUnclampedY - cy, moveUnclampedX - cx)
                                                 val deg = ((Math.toDegrees(angleRad.toDouble()).toFloat() + 90f) + 360f) % 360f
                                                 snap.copy(rotationDegrees = deg)
                                             }
-                                            ImageHandleType.NONE -> snap
+                                            else -> snap
                                         }
-                                        pageImages = pageImages.map { if (it.id == snap.id) updatedImg else it }
-                                        return@pointerInteropFilter true
-                                    }
-
-                                    if (isDraggingText && selectedText != null && textDragStartPoint != null && initialTextPos != null) {
-                                        val dx = rawDocX - textDragStartPoint!!.first
-                                        val dy = rawDocY - textDragStartPoint!!.second
-                                        val newX = (initialTextPos!!.first + dx).coerceIn(8f, pageW - 60f)
-                                        val newY = (initialTextPos!!.second + dy).coerceIn(8f, pageH - 24f)
-                                        pageTexts = pageTexts.map {
-                                            if (it.id == selectedText.id) it.copy(x = newX, y = newY) else it
+                                        if (interactPid != null) {
+                                            commitPageImages(
+                                                interactPid,
+                                                getImages(interactPid).map { if (it.id == snap.id) updatedImg else it },
+                                                persistNow = false
+                                            )
                                         }
                                         return@pointerInteropFilter true
                                     }
 
-                                    if (isDraggingLassoSelection && lassoDragLastPoint != null) {
-                                        val dx = rawDocX - lassoDragLastPoint!!.first
-                                        val dy = rawDocY - lassoDragLastPoint!!.second
+                                    if (isDraggingText && selectedTextId != null && textDragStartPoint != null && initialTextPos != null && interactPid != null) {
+                                        val dx = moveUnclampedX - textDragStartPoint!!.first
+                                        val dy = moveUnclampedY - textDragStartPoint!!.second
+                                        val newX = (initialTextPos!!.first + dx).coerceIn(8f, (interactW - 60f).coerceAtLeast(8f))
+                                        val newY = (initialTextPos!!.second + dy).coerceIn(8f, (interactH - 24f).coerceAtLeast(8f))
+                                        pageTextsMap[interactPid] = getTexts(interactPid).map {
+                                            if (it.id == selectedTextId) it.copy(x = newX, y = newY) else it
+                                        }
+                                        return@pointerInteropFilter true
+                                    }
+
+                                    if (isDraggingLassoSelection && lassoDragLastPoint != null && interactPid != null) {
+                                        val dx = moveUnclampedX - lassoDragLastPoint!!.first
+                                        val dy = moveUnclampedY - lassoDragLastPoint!!.second
                                         if (hypot(dx, dy) > 1.5f) {
-                                            currentStrokes = inkEngine.moveSelectedStrokes(dx, dy, currentStrokes)
-                                            lassoDragLastPoint = Pair(rawDocX, rawDocY)
+                                            pageStrokesMap[interactPid] = inkEngine.moveSelectedStrokes(dx, dy, getStrokes(interactPid))
+                                            lassoDragLastPoint = Pair(moveUnclampedX, moveUnclampedY)
                                         }
                                         return@pointerInteropFilter true
                                     }
 
-                                    val (docX, docY) = snapPointToRulerIfNear(rawDocX, rawDocY)
+                                    val (docX, docY) = snapPointToRulerIfNear(moveDocX, moveDocY)
 
                                     when (effectiveTool) {
+                                        ToolType.LASER -> {
+                                            val currentActive = activeLaserTrail ?: LaserStrokeTrail(
+                                                id = UUID.randomUUID().toString(),
+                                                pageId = interactPid ?: "",
+                                                color = laserColorState,
+                                                points = emptyList()
+                                            )
+                                            val pts = currentActive.points
+                                            val lastPt = pts.lastOrNull()
+                                            val smoothedY = if (isLaserUnderlineSnap && lastPt != null) {
+                                                val sdx = abs(moveDocX - lastPt.x)
+                                                val sdy = abs(moveDocY - lastPt.y)
+                                                if (sdx > sdy * 1.35f && sdy < 18f) {
+                                                    lastPt.y * 0.72f + moveDocY * 0.28f
+                                                } else {
+                                                    moveDocY
+                                                }
+                                            } else {
+                                                moveDocY
+                                            }
+                                            if (lastPt == null || hypot(moveDocX - lastPt.x, smoothedY - lastPt.y) > 1.5f) {
+                                                activeLaserTrail = currentActive.copy(
+                                                    points = pts + LaserPoint(moveDocX, smoothedY, System.currentTimeMillis())
+                                                )
+                                            }
+                                        }
                                         ToolType.ERASER_STROKE -> {
-                                            val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, currentStrokes)
-                                            currentStrokes = remaining
+                                            if (interactPid != null) {
+                                                val (remaining, _) = inkEngine.eraseAt(docX, docY, 20f / totalScale, getStrokes(interactPid))
+                                                pageStrokesMap[interactPid] = remaining
+                                            }
                                         }
                                         ToolType.ERASER_PIXEL -> {
-                                            val remaining = inkEngine.erasePartialAt(docX, docY, 16f / totalScale, currentStrokes)
-                                            currentStrokes = remaining
+                                            if (interactPid != null) {
+                                                val remaining = inkEngine.erasePartialAt(docX, docY, 16f / totalScale, getStrokes(interactPid))
+                                                pageStrokesMap[interactPid] = remaining
+                                            }
                                         }
                                         ToolType.LASSO -> {
                                             if (isLassoActive) {
-                                                lassoPoints = lassoPoints + Pair(rawDocX, rawDocY)
+                                                lassoPoints = lassoPoints + Pair(moveDocX, moveDocY)
                                             }
                                         }
                                         ToolType.SHAPE -> {
-                                            shapeCurrentPoint = Pair(rawDocX, rawDocY)
+                                            shapeCurrentPoint = Pair(moveDocX, moveDocY)
                                         }
                                         ToolType.PAN -> {
                                             imageDragStartPoint?.let { start ->
@@ -1188,14 +1696,14 @@ fun NotebookEditorScreen(
                                                 imageDragStartPoint = Pair(touchX, touchY)
 
                                                 if (isContinuousVerticalScroll && pages.size > 1) {
-                                                    val pageGap = 24f
-                                                    val pageTotalH = (pageH + pageGap) * totalScale
-                                                    if (panOffset.y < -pageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
-                                                        navigateToPage(currentPageIndex + 1)
-                                                        panOffset = panOffset.copy(y = panOffset.y + pageTotalH)
-                                                    } else if (panOffset.y > pageTotalH * 0.5f && currentPageIndex > 0) {
-                                                        navigateToPage(currentPageIndex - 1)
-                                                        panOffset = panOffset.copy(y = panOffset.y - pageTotalH)
+                                                    val curPageTotalH = ((currentPage?.height ?: pageH) + pageGapPx) * totalScale
+                                                    if (panOffset.y < -curPageTotalH * 0.5f && currentPageIndex < pages.size - 1) {
+                                                        panOffset = panOffset.copy(y = panOffset.y + curPageTotalH)
+                                                        navigateToPage(currentPageIndex + 1, resetPan = false)
+                                                    } else if (panOffset.y > curPageTotalH * 0.5f && currentPageIndex > 0) {
+                                                        val prevTotalH = ((pages[currentPageIndex - 1].height) + pageGapPx) * totalScale
+                                                        panOffset = panOffset.copy(y = panOffset.y - prevTotalH)
+                                                        navigateToPage(currentPageIndex - 1, resetPan = false)
                                                     }
                                                 }
                                             }
@@ -1209,14 +1717,31 @@ fun NotebookEditorScreen(
                                 }
 
                                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                    val interactPid = activeInteractionPageId ?: activeStrokePageId ?: currentPageId
+                                    val interactPage = pages.find { it.id == interactPid } ?: currentPage
+                                    val interactW = interactPage?.width ?: pageW
+                                    val interactH = interactPage?.height ?: pageH
+                                    val interactOffsetY = getInteractOffsetY(interactPid)
+
+                                    val upUnclampedX = rawDocX
+                                    val upUnclampedY = if (isContinuousVerticalScroll && pages.size > 1) {
+                                        rawDocY - interactOffsetY
+                                    } else {
+                                        rawDocY
+                                    }
+                                    val upDocX = if (isContinuousVerticalScroll && pages.size > 1) upUnclampedX.coerceIn(0f, interactW) else upUnclampedX
+                                    val upDocY = if (isContinuousVerticalScroll && pages.size > 1) upUnclampedY.coerceIn(0f, interactH) else upUnclampedY
+
                                     if (isDraggingReadingGuide) {
                                         isDraggingReadingGuide = false
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
 
                                     if (isDraggingRuler) {
                                         isDraggingRuler = false
                                         rulerDragStart = null
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
 
@@ -1224,9 +1749,10 @@ fun NotebookEditorScreen(
                                         activeImageHandle = ImageHandleType.NONE
                                         imageDragStartPoint = null
                                         initialImageSnapshot = null
-                                        coroutineScope.launch {
-                                            currentPage?.id?.let { repository.savePageImages(it, pageImages) }
+                                        if (interactPid != null) {
+                                            commitPageImages(interactPid, getImages(interactPid))
                                         }
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
 
@@ -1234,76 +1760,88 @@ fun NotebookEditorScreen(
                                         isDraggingText = false
                                         textDragStartPoint = null
                                         initialTextPos = null
-                                        coroutineScope.launch {
-                                            currentPage?.id?.let { repository.savePageTexts(it, pageTexts) }
+                                        if (interactPid != null) {
+                                            commitPageTexts(interactPid, getTexts(interactPid))
                                         }
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
 
                                     if (isDraggingLassoSelection) {
                                         isDraggingLassoSelection = false
                                         lassoDragLastPoint = null
-                                        coroutineScope.launch {
-                                            currentPage?.id?.let { repository.savePageStrokes(it, currentStrokes) }
+                                        if (interactPid != null) {
+                                            commitPageStrokes(interactPid, getStrokes(interactPid))
                                         }
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
 
-                                    // Detect Tap / Click gesture
-                                    val travelDist = hypot(rawDocX - touchDownDocX, rawDocY - touchDownDocY)
-                                    val isTap = travelDist < 14f && (System.currentTimeMillis() - touchDownTime) < 400L
+                                    val screenTravel = hypot(touchX - touchDownScreenX, touchY - touchDownScreenY)
+                                    val isTap = screenTravel < 28f && (System.currentTimeMillis() - touchDownTime) < 450L
 
-                                    // Re-select image on single tap (works in ANY tool mode, cancels accidental micro-stroke)
+                                    // Re-select any inserted image on single tap (works in ANY tool mode & even after cropping)
                                     if (isTap && potentialTappedImageId != null) {
                                         inkEngine.cancelStroke()
                                         activeStrokeState = null
+                                        activeStrokePageId = null
+                                        activeLaserTrail = null
                                         selectedImageId = potentialTappedImageId
                                         selectedTextId = null
+                                        isCroppingImage = false
                                         potentialTappedImageId = null
+                                        activeInteractionPageId = null
                                         return@pointerInteropFilter true
                                     }
                                     potentialTappedImageId = null
 
-                                    // Deselect image/text if tapped on blank canvas
+                                    // Deselect image/crop if tapped on blank canvas
                                     if (isTap && effectiveTool != ToolType.TEXT) {
-                                        val clickedOnImg = pageImages.any { img ->
-                                            rawDocX in img.x..(img.x + img.width) && rawDocY in img.y..(img.y + img.height)
+                                        val clickedOnImg = getImages(interactPid).any { img ->
+                                            isPointInsideImage(upUnclampedX, upUnclampedY, img, pad = 10f / totalScale)
                                         }
-                                        if (!clickedOnImg && selectedImageId != null) {
+                                        if (!clickedOnImg && (selectedImageId != null || isCroppingImage)) {
                                             selectedImageId = null
+                                            isCroppingImage = false
                                         }
                                     }
 
                                     when (effectiveTool) {
+                                        ToolType.LASER -> {
+                                            activeLaserTrail?.let { finished ->
+                                                if (finished.points.size >= 2) {
+                                                    laserTrails = (laserTrails + finished).takeLast(12)
+                                                }
+                                            }
+                                            activeLaserTrail = null
+                                        }
                                         ToolType.ERASER_STROKE, ToolType.ERASER_PIXEL -> {
-                                            coroutineScope.launch {
-                                                currentPage?.id?.let { repository.savePageStrokes(it, currentStrokes) }
+                                            if (interactPid != null) {
+                                                commitPageStrokes(interactPid, getStrokes(interactPid))
                                             }
                                         }
                                         ToolType.LASSO -> {
                                             if (isLassoActive) {
-                                                selectedStrokes = inkEngine.selectWithLasso(lassoPoints, currentStrokes)
+                                                selectedStrokes = inkEngine.selectWithLasso(lassoPoints, getStrokes(interactPid))
                                                 isLassoActive = false
                                             }
                                         }
                                         ToolType.SHAPE -> {
                                             shapeStartPoint?.let { start ->
-                                                if (hypot(rawDocX - start.first, rawDocY - start.second) > 6f) {
+                                                if (hypot(upDocX - start.first, upDocY - start.second) > 6f) {
                                                     val createdStroke = ShapeFactory.createPresetShape(
                                                         type = selectedPresetShape,
                                                         startX = start.first,
                                                         startY = start.second,
-                                                        endX = rawDocX,
-                                                        endY = rawDocY,
+                                                        endX = upDocX,
+                                                        endY = upDocY,
                                                         color = activeColorState,
                                                         width = activeWidthState,
                                                         opacity = inkEngine.currentOpacity
                                                     )
                                                     inkEngine.recordAddedStroke(createdStroke)
-                                                    val updated = currentStrokes + createdStroke
-                                                    currentStrokes = updated
-                                                    coroutineScope.launch {
-                                                        currentPage?.id?.let { repository.savePageStrokes(it, updated) }
+                                                    if (interactPid != null) {
+                                                        commitPageStrokes(interactPid, getStrokes(interactPid) + createdStroke)
                                                     }
                                                 }
                                             }
@@ -1316,6 +1854,8 @@ fun NotebookEditorScreen(
                                         else -> {
                                             var completed = inkEngine.finishStroke()
                                             activeStrokeState = null
+                                            val strokePid = activeStrokePageId ?: interactPid
+                                            activeStrokePageId = null
 
                                             if (completed != null) {
                                                 if (isShapeSnapEnabled) {
@@ -1326,14 +1866,13 @@ fun NotebookEditorScreen(
                                                     }
                                                 }
 
-                                                val updated = currentStrokes + completed
-                                                currentStrokes = updated
-                                                coroutineScope.launch {
-                                                    currentPage?.id?.let { repository.savePageStrokes(it, updated) }
+                                                if (strokePid != null) {
+                                                    commitPageStrokes(strokePid, getStrokes(strokePid) + completed)
                                                 }
                                             }
                                         }
                                     }
+                                    activeInteractionPageId = null
                                     true
                                 }
                                 else -> false
@@ -1351,293 +1890,447 @@ fun NotebookEditorScreen(
                                 transformOrigin = TransformOrigin(0f, 0f)
                             }
                     ) {
-                        // 1 & 2. Draw Page Background and PDF Bitmaps / Templates
-                        if (isContinuousVerticalScroll && pages.isNotEmpty()) {
-                            val pageGap = 24f
-                            val pageTotalH = pageH + pageGap
+                        val animTick = laserRenderTick
+                        val nowLaserMs = System.currentTimeMillis()
+
+                        val pagesToRender = if (isContinuousVerticalScroll && pages.isNotEmpty()) {
                             val minIdx = (currentPageIndex - 2).coerceAtLeast(0)
                             val maxIdx = (currentPageIndex + 2).coerceAtMost(pages.size - 1)
-
-                            for (idx in minIdx..maxIdx) {
-                                val p = pages[idx]
-                                val yOffset = (idx - currentPageIndex) * pageTotalH
-
-                                // Page Surface White Background
-                                drawRect(
-                                    color = Color.White,
-                                    topLeft = Offset(0f, yOffset),
-                                    size = Size(pageW, pageH)
-                                )
-                                // Subtle Page Border / Shadow
-                                drawRect(
-                                    color = Color(0xFFCBD5E1),
-                                    topLeft = Offset(0f, yOffset),
-                                    size = Size(pageW, pageH),
-                                    style = Stroke(width = 1f)
-                                )
-
-                                val pdfIdx = p.pdfPageIndex ?: (if (document?.type == DocumentType.PDF) p.index else null)
-                                val pBmp = if (pdfIdx != null) (pdfBitmaps[pdfIdx] ?: (if (idx == currentPageIndex) pdfBitmap else null)) else null
-
-                                if (pBmp != null) {
-                                    drawImage(
-                                        image = pBmp.asImageBitmap(),
-                                        dstOffset = IntOffset(0, yOffset.toInt()),
-                                        dstSize = IntSize(pageW.toInt(), pageH.toInt())
-                                    )
-                                } else {
-                                    drawContext.canvas.save()
-                                    drawContext.canvas.translate(0f, yOffset)
-                                    TemplateRenderer.drawTemplate(this, p.template, pageW, pageH)
-                                    drawContext.canvas.restore()
-                                }
-
-                                // Inter-page dashed line & page divider badge
-                                if (idx < pages.size - 1) {
-                                    drawLine(
-                                        color = Color(0xFF94A3B8),
-                                        start = Offset(0f, yOffset + pageH + pageGap / 2f),
-                                        end = Offset(pageW, yOffset + pageH + pageGap / 2f),
-                                        strokeWidth = 1f,
-                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
-                                    )
-                                }
-                            }
+                            (minIdx..maxIdx).toList()
+                        } else if (pages.isNotEmpty()) {
+                            listOf(currentPageIndex.coerceIn(0, pages.lastIndex))
                         } else {
-                            // Single Page View
+                            emptyList()
+                        }
+
+                        for (idx in pagesToRender) {
+                            val p = pages[idx]
+                            val pW = p.width
+                            val pH = p.height
+                            val yOffset = getPageYOffset(idx)
+                            val isCurrentRenderPage = p.id == currentPageId
+
+                            // 1. Page Surface Background & Subtle Border
                             drawRect(
                                 color = Color.White,
-                                topLeft = Offset.Zero,
-                                size = Size(pageW, pageH)
+                                topLeft = Offset(0f, yOffset),
+                                size = Size(pW, pH)
                             )
                             drawRect(
                                 color = Color(0xFFCBD5E1),
-                                topLeft = Offset.Zero,
-                                size = Size(pageW, pageH),
+                                topLeft = Offset(0f, yOffset),
+                                size = Size(pW, pH),
                                 style = Stroke(width = 1f)
                             )
 
-                            val effectivePdfIdx = currentPage?.pdfPageIndex ?: (if (document?.type == DocumentType.PDF) currentPageIndex else null)
-                            val pagePdfBmp = if (effectivePdfIdx != null) (pdfBitmaps[effectivePdfIdx] ?: pdfBitmap) else null
+                            // 2. Render PDF Page Bitmap or Paper Template
+                            val pdfIdx = p.pdfPageIndex ?: (if (document?.type == DocumentType.PDF) p.index else null)
+                            val pBmp = if (pdfIdx != null) (pdfBitmaps[pdfIdx] ?: (if (idx == currentPageIndex) pdfBitmap else null)) else null
 
-                            if (pagePdfBmp != null) {
+                            if (pBmp != null) {
                                 drawImage(
-                                    image = pagePdfBmp.asImageBitmap(),
-                                    dstOffset = IntOffset.Zero,
-                                    dstSize = IntSize(pageW.toInt(), pageH.toInt())
+                                    image = pBmp.asImageBitmap(),
+                                    dstOffset = IntOffset(0, yOffset.toInt()),
+                                    dstSize = IntSize(pW.toInt().coerceAtLeast(1), pH.toInt().coerceAtLeast(1))
                                 )
                             } else {
-                                currentPage?.template?.let { tmpl ->
-                                    TemplateRenderer.drawTemplate(this, tmpl, pageW, pageH)
-                                }
-                            }
-                        }
-
-                        // 3. Draw Inserted Images (sorted by zIndex, with non-destructive crop)
-                        for (img in pageImages.sortedBy { it.zIndex }) {
-                            val bmp = imageBitmaps[img.filePath]
-                            if (bmp != null) {
                                 drawContext.canvas.save()
-                                val cx = img.x + img.width / 2f
-                                val cy = img.y + img.height / 2f
-                                drawContext.canvas.translate(cx, cy)
-                                if (img.rotationDegrees != 0f) {
-                                    drawContext.canvas.rotate(img.rotationDegrees)
-                                }
-                                val sx = if (img.isFlippedHorizontal) -1f else 1f
-                                val sy = if (img.isFlippedVertical) -1f else 1f
-                                if (sx != 1f || sy != 1f) {
-                                    drawContext.canvas.scale(sx, sy)
-                                }
-                                drawContext.canvas.translate(-img.width / 2f, -img.height / 2f)
-
-                                val cLeft = (img.cropLeft.coerceIn(0f, 0.95f) * bmp.width).roundToInt()
-                                val cTop = (img.cropTop.coerceIn(0f, 0.95f) * bmp.height).roundToInt()
-                                val cRight = (img.cropRight.coerceIn(cLeft / bmp.width.toFloat() + 0.05f, 1f) * bmp.width).roundToInt()
-                                val cBottom = (img.cropBottom.coerceIn(cTop / bmp.height.toFloat() + 0.05f, 1f) * bmp.height).roundToInt()
-
-                                drawImage(
-                                    image = bmp.asImageBitmap(),
-                                    srcOffset = IntOffset(cLeft, cTop),
-                                    srcSize = IntSize((cRight - cLeft).coerceAtLeast(1), (cBottom - cTop).coerceAtLeast(1)),
-                                    dstOffset = IntOffset.Zero,
-                                    dstSize = IntSize(img.width.toInt().coerceAtLeast(1), img.height.toInt().coerceAtLeast(1)),
-                                    alpha = img.opacity
-                                )
+                                drawContext.canvas.translate(0f, yOffset)
+                                TemplateRenderer.drawTemplate(this, p.template, pW, pH)
                                 drawContext.canvas.restore()
                             }
-                        }
 
-                        // 4. Draw Selected Image Bounding Box & Handles
-                        selectedImage?.let { img ->
-                            drawRect(
-                                color = Color(0xFF2563EB),
-                                topLeft = Offset(img.x, img.y),
-                                size = Size(img.width, img.height),
-                                style = Stroke(
-                                    width = 2f / totalScale,
-                                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f / totalScale, 8f / totalScale), 0f)
-                                )
-                            )
+                            // Per-page Annotations (Images, Selection/Crop UI, Text Notes, Strokes, Lasso, Laser)
+                            drawContext.canvas.save()
+                            drawContext.canvas.translate(0f, yOffset)
 
-                            val handleR = 6.5f / totalScale
-                            val corners = listOf(
-                                Offset(img.x, img.y),
-                                Offset(img.x + img.width, img.y),
-                                Offset(img.x, img.y + img.height),
-                                Offset(img.x + img.width, img.y + img.height)
-                            )
-                            for (c in corners) {
-                                drawCircle(color = Color.White, radius = handleR, center = c)
-                                drawCircle(color = Color(0xFF2563EB), radius = handleR, center = c, style = Stroke(width = 2f / totalScale))
-                            }
+                            // 3. Draw Inserted Images for THIS page
+                            val pImages = getImages(p.id)
+                            for (img in pImages.sortedBy { it.zIndex }) {
+                                val bmp = imageBitmaps[img.filePath]
+                                if (bmp != null) {
+                                    if (isCroppingImage && isCurrentRenderPage && img.id == selectedImageId) {
+                                        // Interactive Crop Preview: Full uncropped photo ghost + darkened mask + crisp live crop window + 8 handles
+                                        val frame = computeUncroppedFrame(img)
+                                        drawContext.canvas.save()
+                                        drawContext.canvas.translate(frame.centerX, frame.centerY)
+                                        if (img.rotationDegrees != 0f) {
+                                            drawContext.canvas.rotate(img.rotationDegrees)
+                                        }
+                                        val sx = if (img.isFlippedHorizontal) -1f else 1f
+                                        val sy = if (img.isFlippedVertical) -1f else 1f
+                                        if (sx != 1f || sy != 1f) {
+                                            drawContext.canvas.scale(sx, sy)
+                                        }
+                                        drawContext.canvas.translate(-frame.centerX, -frame.centerY)
 
-                            val topMid = Offset(img.x + img.width / 2f, img.y)
-                            val rotKnob = Offset(img.x + img.width / 2f, img.y - 22f / totalScale)
-                            drawLine(color = Color(0xFF2563EB), start = topMid, end = rotKnob, strokeWidth = 1.5f / totalScale)
-                            drawCircle(color = Color(0xFF2563EB), radius = handleR, center = rotKnob)
-                        }
+                                        // Full uncropped reference (dimmed)
+                                        drawImage(
+                                            image = bmp.asImageBitmap(),
+                                            srcOffset = IntOffset.Zero,
+                                            srcSize = IntSize(bmp.width, bmp.height),
+                                            dstOffset = IntOffset(frame.fullX.roundToInt(), frame.fullY.roundToInt()),
+                                            dstSize = IntSize(frame.fullW.roundToInt().coerceAtLeast(1), frame.fullH.roundToInt().coerceAtLeast(1)),
+                                            alpha = 0.35f
+                                        )
 
-                        // 5. Draw Placed Page Text Objects (Background Card + Real Multiline Text + Selection Frame)
-                        for (txt in pageTexts.sortedBy { it.zIndex }) {
-                            val lines = txt.text.split("\n")
-                            val lineHeight = txt.fontSizeSp * 1.35f
-                            val maxLineLen = (lines.maxOfOrNull { it.length } ?: 1).coerceAtLeast(4)
-                            val boxW = (maxLineLen * txt.fontSizeSp * 0.6f + 20f).coerceAtLeast(64f)
-                            val boxH = lines.size * lineHeight + 12f
+                                        val cropL = frame.fullX + liveCropLeft * frame.fullW
+                                        val cropR = frame.fullX + liveCropRight * frame.fullW
+                                        val cropT = frame.fullY + liveCropTop * frame.fullH
+                                        val cropB = frame.fullY + liveCropBottom * frame.fullH
 
-                            txt.backgroundColor?.let { bgCol ->
-                                drawRoundRect(
-                                    color = Color(bgCol.toInt()),
-                                    topLeft = Offset(txt.x - 6f, txt.y - 4f),
-                                    size = Size(boxW, boxH),
-                                    cornerRadius = CornerRadius(6f, 6f)
-                                )
-                            }
+                                        // Dark scrim outside crop box inside uncropped frame
+                                        drawRect(Color(0x66000000), topLeft = Offset(frame.fullX, frame.fullY), size = Size(frame.fullW, (cropT - frame.fullY).coerceAtLeast(0f)))
+                                        drawRect(Color(0x66000000), topLeft = Offset(frame.fullX, cropB), size = Size(frame.fullW, (frame.fullY + frame.fullH - cropB).coerceAtLeast(0f)))
+                                        drawRect(Color(0x66000000), topLeft = Offset(frame.fullX, cropT), size = Size((cropL - frame.fullX).coerceAtLeast(0f), (cropB - cropT).coerceAtLeast(0f)))
+                                        drawRect(Color(0x66000000), topLeft = Offset(cropR, cropT), size = Size((frame.fullX + frame.fullW - cropR).coerceAtLeast(0f), (cropB - cropT).coerceAtLeast(0f)))
 
-                            val style = when {
-                                txt.isBold && txt.isItalic -> Typeface.BOLD_ITALIC
-                                txt.isBold -> Typeface.BOLD
-                                txt.isItalic -> Typeface.ITALIC
-                                else -> Typeface.NORMAL
-                            }
-                            val textPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
-                                color = txt.color.toInt()
-                                textSize = txt.fontSizeSp
-                                typeface = Typeface.create(Typeface.DEFAULT, style)
-                            }
-                            for ((idx, line) in lines.withIndex()) {
-                                drawContext.canvas.nativeCanvas.drawText(
-                                    line,
-                                    txt.x,
-                                    txt.y + txt.fontSizeSp + idx * lineHeight,
-                                    textPaint
-                                )
-                            }
+                                        // Sharp cropped preview inside crop region
+                                        val srcL = (liveCropLeft.coerceIn(0f, 0.95f) * bmp.width).roundToInt()
+                                        val srcT = (liveCropTop.coerceIn(0f, 0.95f) * bmp.height).roundToInt()
+                                        val srcR = (liveCropRight.coerceIn(liveCropLeft + 0.05f, 1f) * bmp.width).roundToInt()
+                                        val srcB = (liveCropBottom.coerceIn(liveCropTop + 0.05f, 1f) * bmp.height).roundToInt()
+                                        drawImage(
+                                            image = bmp.asImageBitmap(),
+                                            srcOffset = IntOffset(srcL, srcT),
+                                            srcSize = IntSize((srcR - srcL).coerceAtLeast(1), (srcB - srcT).coerceAtLeast(1)),
+                                            dstOffset = IntOffset(cropL.roundToInt(), cropT.roundToInt()),
+                                            dstSize = IntSize((cropR - cropL).roundToInt().coerceAtLeast(1), (cropB - cropT).roundToInt().coerceAtLeast(1)),
+                                            alpha = img.opacity
+                                        )
 
-                            if (txt.id == selectedTextId) {
-                                drawRoundRect(
-                                    color = Color(0xFF2563EB),
-                                    topLeft = Offset(txt.x - 8f, txt.y - 6f),
-                                    size = Size(boxW + 4f, boxH + 4f),
-                                    cornerRadius = CornerRadius(6f, 6f),
-                                    style = Stroke(
-                                        width = 1.8f / totalScale,
-                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f / totalScale, 6f / totalScale), 0f)
-                                    )
-                                )
-                            }
-                        }
+                                        // Crop border & 3x3 rule-of-thirds grid
+                                        val cropLineStroke = 2f / totalScale
+                                        drawRect(
+                                            color = Color.White,
+                                            topLeft = Offset(cropL, cropT),
+                                            size = Size(cropR - cropL, cropB - cropT),
+                                            style = Stroke(width = cropLineStroke)
+                                        )
+                                        val thirdW = (cropR - cropL) / 3f
+                                        val thirdH = (cropB - cropT) / 3f
+                                        for (gridIdx in 1..2) {
+                                            drawLine(Color.White.copy(alpha = 0.45f), Offset(cropL + thirdW * gridIdx, cropT), Offset(cropL + thirdW * gridIdx, cropB), cropLineStroke * 0.55f)
+                                            drawLine(Color.White.copy(alpha = 0.45f), Offset(cropL, cropT + thirdH * gridIdx), Offset(cropR, cropT + thirdH * gridIdx), cropLineStroke * 0.55f)
+                                        }
 
-                        // 6. Draw Committed Vector Strokes (with Quadratic Smoothing & Tool-Specific Brush Rendering)
-                        for (stroke in currentStrokes) {
-                            if (stroke.points.size < 2) continue
-                            val isSelected = selectedStrokes.contains(stroke.id)
-                            val isAudioActive = isAudioPlaying && stroke.audioTimestampMs != null &&
-                                    abs(stroke.audioTimestampMs - audioPlayPositionMs) < 1500
+                                        // 4 L-shaped Corner Brackets
+                                        val arm = min(18f / totalScale, min((cropR - cropL) * 0.3f, (cropB - cropT) * 0.3f))
+                                        val cornerStroke = 3.5f / totalScale
+                                        val cornerColor = Color(0xFF38BDF8)
+                                        drawLine(cornerColor, Offset(cropL, cropT), Offset(cropL + arm, cropT), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropL, cropT), Offset(cropL, cropT + arm), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropR, cropT), Offset(cropR - arm, cropT), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropR, cropT), Offset(cropR, cropT + arm), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropL, cropB), Offset(cropL + arm, cropB), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropL, cropB), Offset(cropL, cropB - arm), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropR, cropB), Offset(cropR - arm, cropB), strokeWidth = cornerStroke, cap = StrokeCap.Round)
+                                        drawLine(cornerColor, Offset(cropR, cropB), Offset(cropR, cropB - arm), strokeWidth = cornerStroke, cap = StrokeCap.Round)
 
-                            drawStyledInkStroke(
-                                stroke = stroke,
-                                isSelected = isSelected,
-                                isAudioActive = isAudioActive
-                            )
-                        }
+                                        // 4 Edge Midpoint Handles
+                                        val midX = (cropL + cropR) / 2f
+                                        val midY = (cropT + cropB) / 2f
+                                        val edgeR = 8f / totalScale
+                                        listOf(
+                                            Offset(cropL, midY), Offset(cropR, midY),
+                                            Offset(midX, cropT), Offset(midX, cropB)
+                                        ).forEach { hc ->
+                                            drawCircle(Color.White, edgeR, hc)
+                                            drawCircle(Color(0xFF2563EB), edgeR, hc, style = Stroke(2f / totalScale))
+                                        }
 
-                        // 7. Draw Active Live Inking Stroke
-                        activeStrokeState?.let { active ->
-                            if (active.points.size >= 2) {
-                                drawStyledInkStroke(
-                                    stroke = active,
-                                    isSelected = false,
-                                    isAudioActive = false
-                                )
-                            }
-                        }
+                                        drawContext.canvas.restore()
+                                    } else {
+                                        drawContext.canvas.save()
+                                        val cx = img.x + img.width / 2f
+                                        val cy = img.y + img.height / 2f
+                                        drawContext.canvas.translate(cx, cy)
+                                        if (img.rotationDegrees != 0f) {
+                                            drawContext.canvas.rotate(img.rotationDegrees)
+                                        }
+                                        val sx = if (img.isFlippedHorizontal) -1f else 1f
+                                        val sy = if (img.isFlippedVertical) -1f else 1f
+                                        if (sx != 1f || sy != 1f) {
+                                            drawContext.canvas.scale(sx, sy)
+                                        }
+                                        drawContext.canvas.translate(-img.width / 2f, -img.height / 2f)
 
-                        // 8. Draw Live Preset Shape Preview
-                        if (shapeStartPoint != null && shapeCurrentPoint != null) {
-                            val (sX, sY) = shapeStartPoint!!
-                            val (cX, cY) = shapeCurrentPoint!!
-                            val previewStroke = ShapeFactory.createPresetShape(
-                                type = selectedPresetShape,
-                                startX = sX,
-                                startY = sY,
-                                endX = cX,
-                                endY = cY,
-                                color = activeColorState,
-                                width = activeWidthState
-                            )
-                            if (previewStroke.points.size >= 2) {
-                                val previewPath = Path()
-                                previewPath.moveTo(previewStroke.points[0].x, previewStroke.points[0].y)
-                                for (i in 1 until previewStroke.points.size) {
-                                    previewPath.lineTo(previewStroke.points[i].x, previewStroke.points[i].y)
+                                        val cLeft = (img.cropLeft.coerceIn(0f, 0.95f) * bmp.width).roundToInt()
+                                        val cTop = (img.cropTop.coerceIn(0f, 0.95f) * bmp.height).roundToInt()
+                                        val cRight = (img.cropRight.coerceIn(cLeft / bmp.width.toFloat() + 0.05f, 1f) * bmp.width).roundToInt()
+                                        val cBottom = (img.cropBottom.coerceIn(cTop / bmp.height.toFloat() + 0.05f, 1f) * bmp.height).roundToInt()
+
+                                        drawImage(
+                                            image = bmp.asImageBitmap(),
+                                            srcOffset = IntOffset(cLeft, cTop),
+                                            srcSize = IntSize((cRight - cLeft).coerceAtLeast(1), (cBottom - cTop).coerceAtLeast(1)),
+                                            dstOffset = IntOffset.Zero,
+                                            dstSize = IntSize(img.width.toInt().coerceAtLeast(1), img.height.toInt().coerceAtLeast(1)),
+                                            alpha = img.opacity
+                                        )
+                                        drawContext.canvas.restore()
+                                    }
                                 }
-                                drawPath(
-                                    path = previewPath,
-                                    color = Color(activeColorState.toInt()).copy(alpha = 0.85f),
-                                    style = Stroke(
-                                        width = activeWidthState,
-                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f),
-                                        cap = StrokeCap.Round,
-                                        join = StrokeJoin.Round
+                            }
+
+                            // 4. Selected Image Selection Box & Handles (rotated with image when not cropping)
+                            if (isCurrentRenderPage && !isCroppingImage) {
+                                pImages.find { it.id == selectedImageId }?.let { img ->
+                                    drawContext.canvas.save()
+                                    val cx = img.x + img.width / 2f
+                                    val cy = img.y + img.height / 2f
+                                    if (img.rotationDegrees != 0f) {
+                                        drawContext.canvas.translate(cx, cy)
+                                        drawContext.canvas.rotate(img.rotationDegrees)
+                                        drawContext.canvas.translate(-cx, -cy)
+                                    }
+
+                                    drawRect(
+                                        color = Color(0xFF2563EB),
+                                        topLeft = Offset(img.x, img.y),
+                                        size = Size(img.width, img.height),
+                                        style = Stroke(
+                                            width = 2f / totalScale,
+                                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f / totalScale, 8f / totalScale), 0f)
+                                        )
                                     )
-                                )
-                            }
-                        }
 
-                        // 9. Draw Lasso Selection Polygon & Selected Strokes Bounding Box
-                        if (isLassoActive && lassoPoints.size >= 2) {
-                            val lassoPath = Path()
-                            lassoPath.moveTo(lassoPoints[0].first, lassoPoints[0].second)
-                            for (i in 1 until lassoPoints.size) {
-                                lassoPath.lineTo(lassoPoints[i].first, lassoPoints[i].second)
-                            }
-                            drawPath(
-                                path = lassoPath,
-                                color = Color(0xFF2563EB),
-                                style = Stroke(
-                                    width = 1.5f / totalScale,
-                                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f / totalScale, 10f / totalScale), 0f)
-                                )
-                            )
-                        }
-
-                        if (selectedStrokes.isNotEmpty()) {
-                            inkEngine.getSelectionBounds(currentStrokes)?.let { b ->
-                                drawRect(
-                                    color = Color(0xFF2563EB),
-                                    topLeft = Offset(b.left - 6f, b.top - 6f),
-                                    size = Size((b.right - b.left) + 12f, (b.bottom - b.top) + 12f),
-                                    style = Stroke(
-                                        width = 1.5f / totalScale,
-                                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f / totalScale, 6f / totalScale), 0f)
+                                    val handleR = 7f / totalScale
+                                    val corners = listOf(
+                                        Offset(img.x, img.y),
+                                        Offset(img.x + img.width, img.y),
+                                        Offset(img.x, img.y + img.height),
+                                        Offset(img.x + img.width, img.y + img.height)
                                     )
+                                    for (c in corners) {
+                                        drawCircle(color = Color.White, radius = handleR, center = c)
+                                        drawCircle(color = Color(0xFF2563EB), radius = handleR, center = c, style = Stroke(width = 2f / totalScale))
+                                    }
+
+                                    val topMid = Offset(img.x + img.width / 2f, img.y)
+                                    val rotKnob = Offset(img.x + img.width / 2f, img.y - 22f / totalScale)
+                                    drawLine(color = Color(0xFF2563EB), start = topMid, end = rotKnob, strokeWidth = 1.5f / totalScale)
+                                    drawCircle(color = Color(0xFF2563EB), radius = handleR, center = rotKnob)
+                                    drawContext.canvas.restore()
+                                }
+                            }
+
+                            // 5. Placed Page Text Objects for THIS page
+                            val pTexts = getTexts(p.id)
+                            for (txt in pTexts.sortedBy { it.zIndex }) {
+                                val lines = txt.text.split("\n")
+                                val lineHeight = txt.fontSizeSp * 1.35f
+                                val maxLineLen = (lines.maxOfOrNull { it.length } ?: 1).coerceAtLeast(4)
+                                val boxW = (maxLineLen * txt.fontSizeSp * 0.6f + 20f).coerceAtLeast(64f)
+                                val boxH = lines.size * lineHeight + 12f
+
+                                txt.backgroundColor?.let { bgCol ->
+                                    drawRoundRect(
+                                        color = Color(bgCol.toInt()),
+                                        topLeft = Offset(txt.x - 6f, txt.y - 4f),
+                                        size = Size(boxW, boxH),
+                                        cornerRadius = CornerRadius(6f, 6f)
+                                    )
+                                }
+
+                                val style = when {
+                                    txt.isBold && txt.isItalic -> Typeface.BOLD_ITALIC
+                                    txt.isBold -> Typeface.BOLD
+                                    txt.isItalic -> Typeface.ITALIC
+                                    else -> Typeface.NORMAL
+                                }
+                                val textPaint = AndroidPaint(AndroidPaint.ANTI_ALIAS_FLAG).apply {
+                                    color = txt.color.toInt()
+                                    textSize = txt.fontSizeSp
+                                    typeface = Typeface.create(Typeface.DEFAULT, style)
+                                }
+                                for ((lineIdx, line) in lines.withIndex()) {
+                                    drawContext.canvas.nativeCanvas.drawText(
+                                        line,
+                                        txt.x,
+                                        txt.y + txt.fontSizeSp + lineIdx * lineHeight,
+                                        textPaint
+                                    )
+                                }
+
+                                if (isCurrentRenderPage && txt.id == selectedTextId) {
+                                    drawRoundRect(
+                                        color = Color(0xFF2563EB),
+                                        topLeft = Offset(txt.x - 8f, txt.y - 6f),
+                                        size = Size(boxW + 4f, boxH + 4f),
+                                        cornerRadius = CornerRadius(6f, 6f),
+                                        style = Stroke(
+                                            width = 1.8f / totalScale,
+                                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f / totalScale, 6f / totalScale), 0f)
+                                        )
+                                    )
+                                }
+                            }
+
+                            // 6. Committed Vector Strokes for THIS page
+                            val pStrokes = getStrokes(p.id)
+                            for (stroke in pStrokes) {
+                                if (stroke.points.size < 2) continue
+                                val isSelected = isCurrentRenderPage && selectedStrokes.contains(stroke.id)
+                                val isAudioActive = isAudioPlaying && stroke.audioTimestampMs != null &&
+                                        abs(stroke.audioTimestampMs - audioPlayPositionMs) < 1500
+
+                                drawStyledInkStroke(
+                                    stroke = stroke,
+                                    isSelected = isSelected,
+                                    isAudioActive = isAudioActive
+                                )
+                            }
+
+                            // 7. Live Inking Stroke (on its origin page)
+                            if (p.id == (activeStrokePageId ?: currentPageId)) {
+                                activeStrokeState?.let { active ->
+                                    if (active.points.size >= 2) {
+                                        drawStyledInkStroke(
+                                            stroke = active,
+                                            isSelected = false,
+                                            isAudioActive = false
+                                        )
+                                    }
+                                }
+                            }
+
+                            // 8. Live Preset Shape Preview & Lasso UI (on current active page)
+                            if (isCurrentRenderPage) {
+                                if (shapeStartPoint != null && shapeCurrentPoint != null) {
+                                    val (sX, sY) = shapeStartPoint!!
+                                    val (cX, cY) = shapeCurrentPoint!!
+                                    val previewStroke = ShapeFactory.createPresetShape(
+                                        type = selectedPresetShape,
+                                        startX = sX,
+                                        startY = sY,
+                                        endX = cX,
+                                        endY = cY,
+                                        color = activeColorState,
+                                        width = activeWidthState
+                                    )
+                                    if (previewStroke.points.size >= 2) {
+                                        val previewPath = Path()
+                                        previewPath.moveTo(previewStroke.points[0].x, previewStroke.points[0].y)
+                                        for (i in 1 until previewStroke.points.size) {
+                                            previewPath.lineTo(previewStroke.points[i].x, previewStroke.points[i].y)
+                                        }
+                                        drawPath(
+                                            path = previewPath,
+                                            color = Color(activeColorState.toInt()).copy(alpha = 0.85f),
+                                            style = Stroke(
+                                                width = activeWidthState,
+                                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f),
+                                                cap = StrokeCap.Round,
+                                                join = StrokeJoin.Round
+                                            )
+                                        )
+                                    }
+                                }
+
+                                if (isLassoActive && lassoPoints.size >= 2) {
+                                    val lassoPath = Path()
+                                    lassoPath.moveTo(lassoPoints[0].first, lassoPoints[0].second)
+                                    for (i in 1 until lassoPoints.size) {
+                                        lassoPath.lineTo(lassoPoints[i].first, lassoPoints[i].second)
+                                    }
+                                    drawPath(
+                                        path = lassoPath,
+                                        color = Color(0xFF2563EB),
+                                        style = Stroke(
+                                            width = 1.5f / totalScale,
+                                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f / totalScale, 10f / totalScale), 0f)
+                                        )
+                                    )
+                                }
+
+                                if (selectedStrokes.isNotEmpty()) {
+                                    inkEngine.getSelectionBounds(pStrokes)?.let { b ->
+                                        drawRect(
+                                            color = Color(0xFF2563EB),
+                                            topLeft = Offset(b.left - 6f, b.top - 6f),
+                                            size = Size((b.right - b.left) + 12f, (b.bottom - b.top) + 12f),
+                                            style = Stroke(
+                                                width = 1.5f / totalScale,
+                                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f / totalScale, 6f / totalScale), 0f)
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+
+                            // 9. Glowing Fading Laser Reading Trails for THIS page (fades from behind as you underline text)
+                            @Suppress("UNUSED_VARIABLE")
+                            val triggerFrame = animTick
+                            val pageLasers = laserTrails.filter { it.pageId == p.id } +
+                                    listOfNotNull(activeLaserTrail?.takeIf { it.pageId == p.id })
+                            val laserScaleDiv = totalScale.coerceAtLeast(0.75f)
+                            for (trail in pageLasers) {
+                                val pts = trail.points
+                                if (pts.size < 2) continue
+                                val baseCol = Color(trail.color.toInt())
+                                for (i in 0 until pts.size - 1) {
+                                    val ptA = pts[i]
+                                    val ptB = pts[i + 1]
+                                    val ageMs = (nowLaserMs - ptB.timestampMs).coerceAtLeast(0L)
+                                    val life = (1f - ageMs / 1700f).coerceIn(0f, 1f)
+                                    if (life <= 0.01f) continue
+                                    val fade = life.pow(1.25f)
+
+                                    drawLine(
+                                        color = baseCol.copy(alpha = fade * 0.28f),
+                                        start = Offset(ptA.x, ptA.y),
+                                        end = Offset(ptB.x, ptB.y),
+                                        strokeWidth = (11f / laserScaleDiv) * (0.4f + 0.6f * life),
+                                        cap = StrokeCap.Round
+                                    )
+                                    drawLine(
+                                        color = baseCol.copy(alpha = fade * 0.92f),
+                                        start = Offset(ptA.x, ptA.y),
+                                        end = Offset(ptB.x, ptB.y),
+                                        strokeWidth = (3.4f / laserScaleDiv) * (0.5f + 0.5f * life),
+                                        cap = StrokeCap.Round
+                                    )
+                                    drawLine(
+                                        color = Color.White.copy(alpha = fade * 0.85f),
+                                        start = Offset(ptA.x, ptA.y),
+                                        end = Offset(ptB.x, ptB.y),
+                                        strokeWidth = (1.3f / laserScaleDiv) * life,
+                                        cap = StrokeCap.Round
+                                    )
+                                }
+                                val tip = pts.last()
+                                val tipAge = (nowLaserMs - tip.timestampMs).coerceAtLeast(0L)
+                                val tipLife = (1f - tipAge / 500f).coerceIn(0f, 1f)
+                                if (tipLife > 0.05f) {
+                                    drawCircle(
+                                        color = baseCol.copy(alpha = tipLife * 0.35f),
+                                        radius = 9f / laserScaleDiv,
+                                        center = Offset(tip.x, tip.y)
+                                    )
+                                    drawCircle(
+                                        color = Color.White.copy(alpha = tipLife * 0.95f),
+                                        radius = 2.6f / laserScaleDiv,
+                                        center = Offset(tip.x, tip.y)
+                                    )
+                                }
+                            }
+
+                            drawContext.canvas.restore()
+
+                            // Inter-page dashed separator in continuous scroll mode
+                            if (isContinuousVerticalScroll && idx < pages.lastIndex) {
+                                drawLine(
+                                    color = Color(0xFF94A3B8),
+                                    start = Offset(0f, yOffset + pH + pageGapPx / 2f),
+                                    end = Offset(pW, yOffset + pH + pageGapPx / 2f),
+                                    strokeWidth = 1f,
+                                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
                                 )
                             }
                         }
 
-                        // 10. Draw Interactive Digital Ruler Overlay
+                        // 10. Interactive Digital Ruler Overlay (drawn relative to active page viewport)
                         if (showRuler) {
                             drawContext.canvas.save()
                             drawContext.canvas.translate(rulerX, rulerY)
@@ -1662,7 +2355,6 @@ fun NotebookEditorScreen(
                                 style = Stroke(width = 1.5f)
                             )
 
-                            // Graduated tick marks along top and bottom edges
                             var tx = -200f
                             while (tx <= 200f) {
                                 val isMajor = (tx.toInt() % 50 == 0)
@@ -1697,30 +2389,26 @@ fun NotebookEditorScreen(
                             drawContext.canvas.restore()
                         }
 
-                        // 11. Draw PDF Reading Guide Overlay (Red Border with White Center, fading trail behind, interactive toggle/drag)
+                        // 11. PDF Reading Guide Overlay (Red Border with White Center, fading trail)
                         if (showReadingGuide) {
                             val rY = readingGuideY.coerceIn(6f, pageH - 6f)
                             val guideHeight = 14f / totalScale
                             val borderThickness = 2.5f / totalScale
 
-                            // 11a. Draw fading ghost trail lines BELOW the current guide (behind where the user already read)
                             readingGuideTrail.forEachIndexed { idx, trailY ->
                                 val trailAlpha = (0.55f - idx * 0.08f).coerceAtLeast(0f)
                                 if (trailAlpha <= 0f) return@forEachIndexed
                                 val ty = trailY.coerceIn(6f, pageH - 6f)
-                                // Top border ghost
                                 drawRect(
                                     color = Color(0xFFDC2626).copy(alpha = trailAlpha * 0.7f),
                                     topLeft = Offset(0f, ty - guideHeight / 2f),
                                     size = Size(pageW, borderThickness)
                                 )
-                                // White center ghost
                                 drawRect(
                                     color = Color.White.copy(alpha = trailAlpha * 0.5f),
                                     topLeft = Offset(0f, ty - guideHeight / 2f + borderThickness),
                                     size = Size(pageW, guideHeight - borderThickness * 2)
                                 )
-                                // Bottom border ghost
                                 drawRect(
                                     color = Color(0xFFDC2626).copy(alpha = trailAlpha * 0.7f),
                                     topLeft = Offset(0f, ty + guideHeight / 2f - borderThickness),
@@ -1728,54 +2416,47 @@ fun NotebookEditorScreen(
                                 )
                             }
 
-                            // 11b. Main Reading Guide (vivid red border, semi-transparent white center)
-                            // 1. Top Red Border
                             drawRect(
                                 color = Color(0xFFDC2626),
                                 topLeft = Offset(0f, rY - guideHeight / 2f),
                                 size = Size(pageW, borderThickness)
                             )
-                            // 2. White Center Stripe (semi-translucent so text behind is legible)
                             drawRect(
                                 color = Color.White.copy(alpha = 0.88f),
                                 topLeft = Offset(0f, rY - guideHeight / 2f + borderThickness),
                                 size = Size(pageW, guideHeight - borderThickness * 2)
                             )
-                            // 3. Bottom Red Border
                             drawRect(
                                 color = Color(0xFFDC2626),
                                 topLeft = Offset(0f, rY + guideHeight / 2f - borderThickness),
                                 size = Size(pageW, borderThickness)
                             )
 
-                            // 4. Reading Guide Handle tabs on left and right margins
                             val tabW = 28f / totalScale
                             val tabH = 16f / totalScale
-                            // Left tab
                             drawRoundRect(
                                 color = Color(0xFFDC2626),
                                 topLeft = Offset(2f, rY - tabH / 2f),
                                 size = Size(tabW, tabH),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(tabH / 2f, tabH / 2f)
+                                cornerRadius = CornerRadius(tabH / 2f, tabH / 2f)
                             )
                             drawRoundRect(
                                 color = Color.White,
                                 topLeft = Offset(4f, rY - (tabH - 4f) / 2f),
                                 size = Size(tabW - 4f, tabH - 4f),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
+                                cornerRadius = CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
                             )
-                            // Right tab
                             drawRoundRect(
                                 color = Color(0xFFDC2626),
                                 topLeft = Offset(pageW - tabW - 2f, rY - tabH / 2f),
                                 size = Size(tabW, tabH),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(tabH / 2f, tabH / 2f)
+                                cornerRadius = CornerRadius(tabH / 2f, tabH / 2f)
                             )
                             drawRoundRect(
                                 color = Color.White,
                                 topLeft = Offset(pageW - tabW, rY - (tabH - 4f) / 2f),
                                 size = Size(tabW - 4f, tabH - 4f),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
+                                cornerRadius = CornerRadius((tabH - 4f) / 2f, (tabH - 4f) / 2f)
                             )
                         }
                     }
@@ -1898,6 +2579,7 @@ fun NotebookEditorScreen(
 
                 // --- FLOATING IMAGE CONTEXTUAL TOOLBAR ---
                 selectedImage?.let { img ->
+                    val imgPid = img.pageId.ifEmpty { currentPageId ?: "" }
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -1921,69 +2603,121 @@ fun NotebookEditorScreen(
                                 fontSize = 12.sp
                             )
 
-                            // Crop & Adjust Dialog
+                            // Interactive Canvas Crop (4 corners + 4 edges on full uncropped preview without aspect distortion)
                             FilledTonalButton(
-                                onClick = { showImageCropDialog = true },
+                                onClick = {
+                                    if (isCroppingImage) {
+                                        val cropped = applyImageCrop(img, liveCropLeft, liveCropTop, liveCropRight, liveCropBottom)
+                                        val updated = getImages(imgPid).map { pi ->
+                                            if (pi.id == img.id) cropped else pi
+                                        }
+                                        commitPageImages(imgPid, updated)
+                                        selectedImageId = img.id
+                                        isCroppingImage = false
+                                    } else {
+                                        liveCropLeft = img.cropLeft
+                                        liveCropTop = img.cropTop
+                                        liveCropRight = img.cropRight
+                                        liveCropBottom = img.cropBottom
+                                        isCroppingImage = true
+                                    }
+                                },
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                modifier = Modifier.height(30.dp)
+                                modifier = Modifier.height(30.dp),
+                                colors = if (isCroppingImage) ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                                ) else ButtonDefaults.filledTonalButtonColors()
                             ) {
-                                Icon(Icons.Default.Crop, contentDescription = "Crop", modifier = Modifier.size(15.dp))
+                                Icon(if (isCroppingImage) Icons.Default.Check else Icons.Default.Crop, contentDescription = "Crop", modifier = Modifier.size(15.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Crop & Opacity", fontSize = 11.sp)
+                                Text(if (isCroppingImage) "Apply Crop" else "Crop", fontSize = 11.sp)
+                            }
+
+                            // Reset / Cancel Crop
+                            if (isCroppingImage) {
+                                TextButton(
+                                    onClick = {
+                                        liveCropLeft = 0f; liveCropTop = 0f
+                                        liveCropRight = 1f; liveCropBottom = 1f
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) { Text("Reset", fontSize = 11.sp) }
+
+                                TextButton(
+                                    onClick = { isCroppingImage = false },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) { Text("Cancel", fontSize = 11.sp) }
+                            }
+
+                            // Opacity slider (always visible in toolbar when image selected)
+                            if (!isCroppingImage) {
+                                Text("α", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 4.dp))
+                                Slider(
+                                    value = img.opacity,
+                                    onValueChange = { op ->
+                                        val updated = getImages(imgPid).map { pi ->
+                                            if (pi.id == img.id) pi.copy(opacity = op) else pi
+                                        }
+                                        commitPageImages(imgPid, updated, persistNow = false)
+                                    },
+                                    onValueChangeFinished = {
+                                        commitPageImages(imgPid, getImages(imgPid), persistNow = true)
+                                    },
+                                    valueRange = 0.15f..1f,
+                                    modifier = Modifier.width(80.dp)
+                                )
                             }
 
                             // Rotate 90 deg clockwise
                             IconButton(onClick = {
-                                val updated = pageImages.map {
+                                val updated = getImages(imgPid).map {
                                     if (it.id == img.id) it.copy(rotationDegrees = (it.rotationDegrees + 90f) % 360f) else it
                                 }
-                                pageImages = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                commitPageImages(imgPid, updated)
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Rotate 90°", modifier = Modifier.size(18.dp))
                             }
 
                             // Flip Horizontal
                             IconButton(onClick = {
-                                val updated = pageImages.map {
+                                val updated = getImages(imgPid).map {
                                     if (it.id == img.id) it.copy(isFlippedHorizontal = !it.isFlippedHorizontal) else it
                                 }
-                                pageImages = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                commitPageImages(imgPid, updated)
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.Flip, contentDescription = "Flip Horizontal", modifier = Modifier.size(18.dp))
                             }
 
                             // Flip Vertical
                             IconButton(onClick = {
-                                val updated = pageImages.map {
+                                val updated = getImages(imgPid).map {
                                     if (it.id == img.id) it.copy(isFlippedVertical = !it.isFlippedVertical) else it
                                 }
-                                pageImages = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                commitPageImages(imgPid, updated)
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.SwapVert, contentDescription = "Flip Vertical", modifier = Modifier.size(18.dp))
                             }
 
                             // Bring to Front
                             IconButton(onClick = {
-                                val maxZ = (pageImages.maxOfOrNull { it.zIndex } ?: 0) + 1
-                                val updated = pageImages.map {
+                                val curImgs = getImages(imgPid)
+                                val maxZ = (curImgs.maxOfOrNull { it.zIndex } ?: 0) + 1
+                                val updated = curImgs.map {
                                     if (it.id == img.id) it.copy(zIndex = maxZ) else it
                                 }
-                                pageImages = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                commitPageImages(imgPid, updated)
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.FlipToFront, contentDescription = "Bring to Front", modifier = Modifier.size(18.dp))
                             }
 
                             // Lock / Unlock
                             IconButton(onClick = {
-                                val updated = pageImages.map {
+                                val updated = getImages(imgPid).map {
                                     if (it.id == img.id) it.copy(isLocked = !it.isLocked) else it
                                 }
-                                pageImages = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                commitPageImages(imgPid, updated)
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(
                                     imageVector = if (img.isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
@@ -1995,31 +2729,34 @@ fun NotebookEditorScreen(
 
                             // Duplicate
                             IconButton(onClick = {
+                                val curImgs = getImages(imgPid)
                                 val copy = img.copy(
                                     id = UUID.randomUUID().toString(),
-                                    x = (img.x + 24f).coerceAtMost(pageW - img.width),
-                                    y = (img.y + 24f).coerceAtMost(pageH - img.height),
-                                    zIndex = (pageImages.maxOfOrNull { it.zIndex } ?: 0) + 1
+                                    x = (img.x + 24f).coerceAtMost((pageW - img.width).coerceAtLeast(24f)),
+                                    y = (img.y + 24f).coerceAtMost((pageH - img.height).coerceAtLeast(24f)),
+                                    zIndex = (curImgs.maxOfOrNull { it.zIndex } ?: 0) + 1
                                 )
-                                val updated = pageImages + copy
-                                pageImages = updated
+                                commitPageImages(imgPid, curImgs + copy)
                                 selectedImageId = copy.id
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                isCroppingImage = false
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate", modifier = Modifier.size(18.dp))
                             }
 
                             // Delete Image
                             IconButton(onClick = {
-                                val updated = pageImages.filter { it.id != img.id }
-                                pageImages = updated
+                                val updated = getImages(imgPid).filter { it.id != img.id }
+                                commitPageImages(imgPid, updated)
                                 selectedImageId = null
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
+                                isCroppingImage = false
                             }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                             }
 
-                            IconButton(onClick = { selectedImageId = null }, modifier = Modifier.size(30.dp)) {
+                            IconButton(onClick = {
+                                selectedImageId = null
+                                isCroppingImage = false
+                            }, modifier = Modifier.size(30.dp)) {
                                 Icon(Icons.Default.Close, contentDescription = "Deselect", modifier = Modifier.size(18.dp))
                             }
                         }
@@ -2028,6 +2765,7 @@ fun NotebookEditorScreen(
 
                 // --- FLOATING TEXT OBJECT CONTEXTUAL TOOLBAR ---
                 selectedText?.let { txt ->
+                    val txtPid = txt.pageId.ifEmpty { currentPageId ?: "" }
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -2063,21 +2801,19 @@ fun NotebookEditorScreen(
 
                             // Font Size - / +
                             IconButton(onClick = {
-                                val updated = pageTexts.map {
+                                val updated = getTexts(txtPid).map {
                                     if (it.id == txt.id) it.copy(fontSizeSp = (it.fontSizeSp - 2f).coerceAtLeast(10f)) else it
                                 }
-                                pageTexts = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
+                                commitPageTexts(txtPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.Remove, contentDescription = "Smaller Font", modifier = Modifier.size(16.dp))
                             }
                             Text("${txt.fontSizeSp.toInt()}sp", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                             IconButton(onClick = {
-                                val updated = pageTexts.map {
+                                val updated = getTexts(txtPid).map {
                                     if (it.id == txt.id) it.copy(fontSizeSp = (it.fontSizeSp + 2f).coerceAtMost(48f)) else it
                                 }
-                                pageTexts = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
+                                commitPageTexts(txtPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.Add, contentDescription = "Larger Font", modifier = Modifier.size(16.dp))
                             }
@@ -2086,9 +2822,8 @@ fun NotebookEditorScreen(
                             FilterChip(
                                 selected = txt.isBold,
                                 onClick = {
-                                    val updated = pageTexts.map { if (it.id == txt.id) it.copy(isBold = !it.isBold) else it }
-                                    pageTexts = updated
-                                    coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
+                                    val updated = getTexts(txtPid).map { if (it.id == txt.id) it.copy(isBold = !it.isBold) else it }
+                                    commitPageTexts(txtPid, updated)
                                 },
                                 label = { Text("B", fontWeight = FontWeight.Bold, fontSize = 11.sp) }
                             )
@@ -2097,9 +2832,8 @@ fun NotebookEditorScreen(
                             FilterChip(
                                 selected = txt.isItalic,
                                 onClick = {
-                                    val updated = pageTexts.map { if (it.id == txt.id) it.copy(isItalic = !it.isItalic) else it }
-                                    pageTexts = updated
-                                    coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
+                                    val updated = getTexts(txtPid).map { if (it.id == txt.id) it.copy(isItalic = !it.isItalic) else it }
+                                    commitPageTexts(txtPid, updated)
                                 },
                                 label = { Text("I", fontStyle = FontStyle.Italic, fontSize = 11.sp) }
                             )
@@ -2108,19 +2842,17 @@ fun NotebookEditorScreen(
                             IconButton(onClick = {
                                 val bgCycle = listOf<Long?>(0x80FEF08A, 0x80BAE6FD, 0x80BBF7D0, 0x80FBCFE8, null)
                                 val nextIdx = (bgCycle.indexOf(txt.backgroundColor) + 1) % bgCycle.size
-                                val updated = pageTexts.map { if (it.id == txt.id) it.copy(backgroundColor = bgCycle[nextIdx]) else it }
-                                pageTexts = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
+                                val updated = getTexts(txtPid).map { if (it.id == txt.id) it.copy(backgroundColor = bgCycle[nextIdx]) else it }
+                                commitPageTexts(txtPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.FormatColorFill, contentDescription = "Note Background", modifier = Modifier.size(16.dp))
                             }
 
                             // Delete Text
                             IconButton(onClick = {
-                                val updated = pageTexts.filter { it.id != txt.id }
-                                pageTexts = updated
+                                val updated = getTexts(txtPid).filter { it.id != txt.id }
+                                commitPageTexts(txtPid, updated)
                                 selectedTextId = null
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageTexts(it, updated) } }
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete Text", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                             }
@@ -2134,6 +2866,7 @@ fun NotebookEditorScreen(
 
                 // --- LASSO SELECTION ACTION BAR ---
                 if (selectedStrokes.isNotEmpty() && selectedImage == null && selectedText == null) {
+                    val lassoPid = currentPageId ?: ""
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -2144,7 +2877,9 @@ fun NotebookEditorScreen(
                         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
@@ -2157,47 +2892,42 @@ fun NotebookEditorScreen(
 
                             // Scale Down
                             IconButton(onClick = {
-                                val updated = inkEngine.scaleSelectedStrokes(0.85f, currentStrokes)
-                                currentStrokes = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
+                                val updated = inkEngine.scaleSelectedStrokes(0.85f, getStrokes(lassoPid))
+                                if (lassoPid.isNotEmpty()) commitPageStrokes(lassoPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.ZoomOutMap, contentDescription = "Shrink Selection", modifier = Modifier.size(16.dp))
                             }
 
                             // Scale Up
                             IconButton(onClick = {
-                                val updated = inkEngine.scaleSelectedStrokes(1.18f, currentStrokes)
-                                currentStrokes = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
+                                val updated = inkEngine.scaleSelectedStrokes(1.18f, getStrokes(lassoPid))
+                                if (lassoPid.isNotEmpty()) commitPageStrokes(lassoPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.OpenInFull, contentDescription = "Enlarge Selection", modifier = Modifier.size(16.dp))
                             }
 
                             // Recolor to active color
                             IconButton(onClick = {
-                                val updated = inkEngine.recolorSelectedStrokes(activeColorState, currentStrokes)
-                                currentStrokes = updated
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
+                                val updated = inkEngine.recolorSelectedStrokes(activeColorState, getStrokes(lassoPid))
+                                if (lassoPid.isNotEmpty()) commitPageStrokes(lassoPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.Palette, contentDescription = "Recolor Selection", tint = Color(activeColorState.toInt()), modifier = Modifier.size(18.dp))
                             }
 
                             // Duplicate Selection
                             IconButton(onClick = {
-                                val updated = inkEngine.duplicateSelectedStrokes(24f, 24f, currentStrokes)
-                                currentStrokes = updated
+                                val updated = inkEngine.duplicateSelectedStrokes(24f, 24f, getStrokes(lassoPid))
                                 selectedStrokes = inkEngine.selectedStrokeIds.toSet()
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
+                                if (lassoPid.isNotEmpty()) commitPageStrokes(lassoPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.ContentCopy, contentDescription = "Duplicate Selection", modifier = Modifier.size(16.dp))
                             }
 
                             // Delete Selection
                             IconButton(onClick = {
-                                val updated = inkEngine.deleteSelectedStrokes(currentStrokes)
-                                currentStrokes = updated
+                                val updated = inkEngine.deleteSelectedStrokes(getStrokes(lassoPid))
                                 selectedStrokes = emptySet()
-                                coroutineScope.launch { currentPage?.id?.let { repository.savePageStrokes(it, updated) } }
+                                if (lassoPid.isNotEmpty()) commitPageStrokes(lassoPid, updated)
                             }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete Selection", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(18.dp))
                             }
@@ -2274,6 +3004,65 @@ fun NotebookEditorScreen(
                             modifier = Modifier.size(28.dp)
                         ) {
                             Icon(Icons.Default.AspectRatio, contentDescription = "Fit Width", modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+
+                // Laser Reading Pen Quick Options Bar
+                if (activeToolState == ToolType.LASER) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 94.dp)
+                            .shadow(6.dp, RoundedCornerShape(20.dp)),
+                        shape = RoundedCornerShape(20.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, Color(laserColorState.toInt()).copy(alpha = 0.6f))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Default.Flare, contentDescription = null, tint = Color(laserColorState.toInt()), modifier = Modifier.size(16.dp))
+                            Text("Laser:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(laserColorState.toInt()))
+                            listOf(
+                                0xFFEF4444L to "Red",
+                                0xFF06B6D4L to "Cyan",
+                                0xFF22C55EL to "Green",
+                                0xFFEC4899L to "Pink",
+                                0xFFF59E0BL to "Amber"
+                            ).forEach { (c, label) ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(c.toInt()))
+                                        .border(
+                                            width = if (laserColorState == c) 3.dp else 1.dp,
+                                            color = if (laserColorState == c) MaterialTheme.colorScheme.onSurface else Color.Gray.copy(alpha = 0.4f),
+                                            shape = CircleShape
+                                        )
+                                        .clickable { laserColorState = c },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (laserColorState == c) {
+                                        Icon(Icons.Default.Check, contentDescription = label, modifier = Modifier.size(12.dp), tint = Color.White)
+                                    }
+                                }
+                            }
+                            FilterChip(
+                                selected = isLaserUnderlineSnap,
+                                onClick = { isLaserUnderlineSnap = !isLaserUnderlineSnap },
+                                label = { Text("Underline Snap", fontSize = 11.sp) }
+                            )
+                            FilterChip(
+                                selected = showReadingGuide,
+                                onClick = { showReadingGuide = !showReadingGuide },
+                                label = { Text("Guide Line", fontSize = 11.sp) }
+                            )
                         }
                     }
                 }
@@ -2376,12 +3165,13 @@ fun NotebookEditorScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        // Inking Tools: Fountain Pen, Ballpoint, Pencil, Highlighter, Stroke Eraser, Pixel Eraser
+                        // Inking & Reading Tools: Pen, Ballpoint, Pencil, Highlighter, Laser Reading Pen, Stroke/Pixel Erasers
                         listOf(
                             Triple(ToolType.PEN, Icons.Default.Edit, "Fountain Pen"),
                             Triple(ToolType.BALLPOINT, Icons.Default.DriveFileRenameOutline, "Ballpoint"),
                             Triple(ToolType.PENCIL, Icons.Default.Create, "Pencil"),
                             Triple(ToolType.HIGHLIGHTER, Icons.Default.BorderColor, "Highlighter"),
+                            Triple(ToolType.LASER, Icons.Default.Flare, "Laser Reading Pen"),
                             Triple(ToolType.ERASER_STROKE, Icons.Default.AutoFixNormal, "Stroke Eraser"),
                             Triple(ToolType.ERASER_PIXEL, Icons.Default.CleaningServices, "Pixel Eraser")
                         ).forEach { (tool, icon, label) ->
@@ -2396,12 +3186,22 @@ fun NotebookEditorScreen(
                                 },
                                 modifier = Modifier
                                     .clip(CircleShape)
-                                    .background(if (isSelected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                                    .background(
+                                        when {
+                                            isSelected && tool == ToolType.LASER -> Color(laserColorState.toInt()).copy(alpha = 0.2f)
+                                            isSelected -> MaterialTheme.colorScheme.primaryContainer
+                                            else -> Color.Transparent
+                                        }
+                                    )
                             ) {
                                 Icon(
                                     imageVector = icon,
                                     contentDescription = label,
-                                    tint = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    tint = when {
+                                        isSelected && tool == ToolType.LASER -> Color(laserColorState.toInt())
+                                        isSelected -> MaterialTheme.colorScheme.primary
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
                                 )
                             }
                         }
@@ -2443,11 +3243,11 @@ fun NotebookEditorScreen(
                             )
                         }
 
-                        // Insert Image Button with clear label
+                        // Insert Image from Device Gallery
                         Surface(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(16.dp))
-                                .clickable { imagePickerLauncher.launch("image/*") }
+                                .clickable { launchImageGalleryPicker() }
                                 .padding(horizontal = 4.dp),
                             color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
                         ) {
@@ -2537,11 +3337,9 @@ fun NotebookEditorScreen(
                         IconButton(
                             enabled = inkEngine.canUndo,
                             onClick = {
-                                val undone = inkEngine.undo(currentStrokes)
-                                currentStrokes = undone
-                                coroutineScope.launch {
-                                    currentPage?.id?.let { repository.savePageStrokes(it, undone) }
-                                }
+                                val pid = currentPageId ?: return@IconButton
+                                val undone = inkEngine.undo(getStrokes(pid))
+                                commitPageStrokes(pid, undone)
                             },
                             modifier = Modifier.size(30.dp)
                         ) {
@@ -2551,11 +3349,9 @@ fun NotebookEditorScreen(
                         IconButton(
                             enabled = inkEngine.canRedo,
                             onClick = {
-                                val redone = inkEngine.redo(currentStrokes)
-                                currentStrokes = redone
-                                coroutineScope.launch {
-                                    currentPage?.id?.let { repository.savePageStrokes(it, redone) }
-                                }
+                                val pid = currentPageId ?: return@IconButton
+                                val redone = inkEngine.redo(getStrokes(pid))
+                                commitPageStrokes(pid, redone)
                             },
                             modifier = Modifier.size(30.dp)
                         ) {
@@ -2566,115 +3362,8 @@ fun NotebookEditorScreen(
             }
         }
 
-        // --- IMAGE CROP & ADJUSTMENTS DIALOG ---
-        if (showImageCropDialog && selectedImage != null) {
-            val img = selectedImage
-            var cLeft by remember(img) { mutableFloatStateOf(img.cropLeft) }
-            var cTop by remember(img) { mutableFloatStateOf(img.cropTop) }
-            var cRight by remember(img) { mutableFloatStateOf(img.cropRight) }
-            var cBottom by remember(img) { mutableFloatStateOf(img.cropBottom) }
-            var imgOpacity by remember(img) { mutableFloatStateOf(img.opacity) }
-            var lockAspect by remember(img) { mutableStateOf(img.aspectRatioLocked) }
-
-            AlertDialog(
-                onDismissRequest = { showImageCropDialog = false },
-                title = { Text("Crop & Adjust Image") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Quick Crop Presets:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { cLeft = 0f; cTop = 0f; cRight = 1f; cBottom = 1f }) {
-                                Text("Full", fontSize = 11.sp)
-                            }
-                            OutlinedButton(onClick = { cLeft = 0.1f; cTop = 0.1f; cRight = 0.9f; cBottom = 0.9f }) {
-                                Text("Center 80%", fontSize = 11.sp)
-                            }
-                            OutlinedButton(onClick = { cLeft = 0f; cTop = 0.15f; cRight = 1f; cBottom = 0.85f }) {
-                                Text("16:9 Wide", fontSize = 11.sp)
-                            }
-                        }
-
-                        Text("Horizontal Crop (${(cLeft * 100).toInt()}% – ${(cRight * 100).toInt()}%)", fontSize = 12.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Slider(
-                                value = cLeft,
-                                onValueChange = { cLeft = it.coerceAtMost(cRight - 0.1f) },
-                                valueRange = 0f..0.85f,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Slider(
-                                value = cRight,
-                                onValueChange = { cRight = it.coerceAtLeast(cLeft + 0.1f) },
-                                valueRange = 0.15f..1f,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        Text("Vertical Crop (${(cTop * 100).toInt()}% – ${(cBottom * 100).toInt()}%)", fontSize = 12.sp)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Slider(
-                                value = cTop,
-                                onValueChange = { cTop = it.coerceAtMost(cBottom - 0.1f) },
-                                valueRange = 0f..0.85f,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Slider(
-                                value = cBottom,
-                                onValueChange = { cBottom = it.coerceAtLeast(cTop + 0.1f) },
-                                valueRange = 0.15f..1f,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        HorizontalDivider()
-
-                        Text("Opacity: ${(imgOpacity * 100).toInt()}%", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                        Slider(
-                            value = imgOpacity,
-                            onValueChange = { imgOpacity = it },
-                            valueRange = 0.15f..1.0f
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Lock Aspect Ratio when Resizing", fontSize = 13.sp)
-                            Switch(checked = lockAspect, onCheckedChange = { lockAspect = it })
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(onClick = {
-                        val updated = pageImages.map {
-                            if (it.id == img.id) {
-                                it.copy(
-                                    cropLeft = cLeft,
-                                    cropTop = cTop,
-                                    cropRight = cRight,
-                                    cropBottom = cBottom,
-                                    opacity = imgOpacity,
-                                    aspectRatioLocked = lockAspect
-                                )
-                            } else it
-                        }
-                        pageImages = updated
-                        // PART 2 FIX: Restore selectedImageId so user can re-edit the image immediately after cropping
-                        selectedImageId = img.id
-                        coroutineScope.launch { currentPage?.id?.let { repository.savePageImages(it, updated) } }
-                        showImageCropDialog = false
-                    }) {
-                        Text("Apply")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showImageCropDialog = false }) {
-                        Text("Cancel")
-                    }
-                }
-            )
-        }
+        // --- IMAGE CROP DIALOG (now only Aspect-Ratio lock + presets; actual crop via canvas handles) ---
+        // showImageCropDialog is kept for backward compat but no longer triggered; canvas crop replaces it.
 
         // --- EXPORT PDF DIALOG ---
         if (showExportDialog) {
@@ -2709,9 +3398,9 @@ fun NotebookEditorScreen(
                                     val success = PdfExporter().exportDocumentToPdf(
                                         document = document ?: return@launch,
                                         pages = pages,
-                                        strokeProvider = { pageId -> repository.loadPageStrokes(pageId) },
-                                        imageProvider = { pageId -> repository.loadPageImages(pageId) },
-                                        textProvider = { pageId -> repository.loadPageTexts(pageId) },
+                                        strokeProvider = { pageId -> pageStrokesMap[pageId] ?: repository.loadPageStrokes(pageId) },
+                                        imageProvider = { pageId -> pageImagesMap[pageId] ?: repository.loadPageImages(pageId) },
+                                        textProvider = { pageId -> pageTextsMap[pageId] ?: repository.loadPageTexts(pageId) },
                                         outputFile = exportFile
                                     )
                                     withContext(Dispatchers.Main) {
@@ -2750,14 +3439,18 @@ fun NotebookEditorScreen(
                         .fillMaxWidth()
                         .padding(20.dp)
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text("Page Manager (${pages.size} pages)", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
 
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             OutlinedButton(
                                 onClick = {
                                     currentPage?.let { p ->
@@ -3303,26 +3996,25 @@ fun NotebookEditorScreen(
                         onClick = {
                             if (insertedTextContent.isNotBlank()) {
                                 showInsertTextDialog = false
+                                val pid = currentPage?.id ?: return@Button
                                 val existing = editingTextObject
+                                val curTexts = getTexts(pid)
                                 val updated = if (existing != null) {
-                                    pageTexts.map { if (it.id == existing.id) it.copy(text = insertedTextContent.trim()) else it }
+                                    curTexts.map { if (it.id == existing.id) it.copy(text = insertedTextContent.trim()) else it }
                                 } else {
                                     val newObj = PageTextObject(
                                         id = UUID.randomUUID().toString(),
-                                        pageId = currentPage?.id ?: "",
+                                        pageId = pid,
                                         x = pendingTextInsertDocCoords.first,
                                         y = pendingTextInsertDocCoords.second,
                                         text = insertedTextContent.trim(),
                                         color = activeColorState,
-                                        zIndex = (pageTexts.maxOfOrNull { it.zIndex } ?: 0) + 1
+                                        zIndex = (curTexts.maxOfOrNull { it.zIndex } ?: 0) + 1
                                     )
                                     selectedTextId = newObj.id
-                                    pageTexts + newObj
+                                    curTexts + newObj
                                 }
-                                pageTexts = updated
-                                coroutineScope.launch {
-                                    currentPage?.id?.let { repository.savePageTexts(it, updated) }
-                                }
+                                commitPageTexts(pid, updated)
                                 insertedTextContent = ""
                                 editingTextObject = null
                             }
@@ -3409,18 +4101,16 @@ fun NotebookEditorScreen(
                             Button(
                                 onClick = {
                                     if (quickStudyNoteInput.isNotBlank()) {
+                                        val pid = currentPage?.id ?: return@Button
+                                        val curTexts = getTexts(pid)
                                         val newNote = PageTextObject(
                                             id = UUID.randomUUID().toString(),
-                                            pageId = currentPage?.id ?: "",
+                                            pageId = pid,
                                             x = 72f,
-                                            y = (68f + pageTexts.size * 38f).coerceAtMost((currentPage?.height ?: 842f) - 60f),
+                                            y = (68f + curTexts.size * 38f).coerceAtMost((currentPage?.height ?: 842f) - 60f),
                                             text = quickStudyNoteInput.trim()
                                         )
-                                        val updated = pageTexts + newNote
-                                        pageTexts = updated
-                                        coroutineScope.launch {
-                                            currentPage?.id?.let { repository.savePageTexts(it, updated) }
-                                        }
+                                        commitPageTexts(pid, curTexts + newNote)
                                         quickStudyNoteInput = ""
                                         Toast.makeText(context, "Added note to Page ${currentPageIndex + 1}", Toast.LENGTH_SHORT).show()
                                     }
@@ -3620,9 +4310,9 @@ private fun DrawScope.drawStyledInkStroke(
     drawPath(
         path = strokePath,
         color = baseColor,
-        blendMode = if (isHighlight && !isSelected) BlendMode.Multiply else BlendMode.SrcOver,
+        blendMode = BlendMode.SrcOver,
         style = Stroke(
-            width = if (isHighlight) stroke.width * 3.2f else stroke.width,
+            width = if (isHighlight) (stroke.width * 3.8f).coerceAtLeast(10.5f) else stroke.width,
             cap = if (isHighlight) StrokeCap.Square else StrokeCap.Round,
             join = StrokeJoin.Round,
             pathEffect = if (isPencil) PathEffect.dashPathEffect(floatArrayOf(stroke.width * 2.2f, stroke.width * 0.35f), 0f) else null

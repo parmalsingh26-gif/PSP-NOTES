@@ -150,6 +150,8 @@ fun LibraryScreen(
     )
 
     fun launchPdfPicker() {
+        // Reset stuck state if still showing loading from previous import
+        if (isImportingPdf) isImportingPdf = false
         try {
             pdfPickerLauncher.launch(arrayOf("application/pdf"))
         } catch (_: Throwable) {
@@ -246,9 +248,9 @@ fun LibraryScreen(
     }
 
     Row(modifier = Modifier.fillMaxSize()) {
-        // Navigation Rail for Tablet / Desktop Layout
+        // Navigation Rail for Tablet / Desktop Layout (compact width for phones too)
         NavigationRail(
-            modifier = Modifier.width(88.dp),
+            modifier = Modifier.width(72.dp),
             containerColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.onSurface
         ) {
@@ -310,115 +312,148 @@ fun LibraryScreen(
         // Main Library Content Area
         Scaffold(
             modifier = Modifier.weight(1f),
+            floatingActionButton = {
+                if (selectedFilter != LibraryFilter.TRASH) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (selectedFilter != LibraryFilter.PDFS) {
+                            SmallFloatingActionButton(
+                                onClick = { launchPdfPicker() },
+                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                            ) {
+                                Icon(Icons.Default.PictureAsPdf, contentDescription = "Import PDF")
+                            }
+                        }
+                        ExtendedFloatingActionButton(
+                            onClick = {
+                                if (selectedFilter == LibraryFilter.PDFS) launchPdfPicker()
+                                else showCreateNotebookDialog = true
+                            },
+                            icon = {
+                                Icon(
+                                    imageVector = if (selectedFilter == LibraryFilter.PDFS) Icons.Default.PictureAsPdf else Icons.Default.Add,
+                                    contentDescription = null
+                                )
+                            },
+                            text = {
+                                Text(if (selectedFilter == LibraryFilter.PDFS) "Import PDF" else "New Note")
+                            }
+                        )
+                    }
+                }
+            },
             topBar = {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 16.dp)
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
+                    Column {
+                        Text(
+                            text = "InkFlow Studio",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            text = "Offline-First Note & Study Workspace",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // Responsive Horizontally Scrollable Action Buttons: always accessible on phones & tablets
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
-                            Text(
-                                text = "InkFlow Studio",
-                                style = MaterialTheme.typography.headlineMedium,
-                                color = MaterialTheme.colorScheme.onBackground
+                        Button(
+                            onClick = { launchPdfPicker() },
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selectedFilter == LibraryFilter.PDFS) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer,
+                                contentColor = if (selectedFilter == LibraryFilter.PDFS) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer
                             )
-                            Text(
-                                text = "Offline-First Note & Study Workspace",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                        ) {
+                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Import PDF")
                         }
 
-                        // Action Buttons: New Folder, Import PDF, Whiteboard, New Notebook
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            OutlinedButton(
-                                onClick = { showCreateFolderDialog = true },
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Folder")
-                            }
+                        Button(
+                            onClick = { showCreateNotebookDialog = true },
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("New Notebook")
+                        }
 
-                            OutlinedButton(
-                                onClick = { launchPdfPicker() },
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Import PDF")
-                            }
+                        OutlinedButton(
+                            onClick = { showCreateWhiteboardDialog = true },
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Dashboard, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Whiteboard")
+                        }
 
-                            OutlinedButton(
-                                onClick = { showCreateWhiteboardDialog = true },
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Icon(Icons.Default.Dashboard, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Whiteboard")
-                            }
-
-                            Button(
-                                onClick = { showCreateNotebookDialog = true },
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("New Notebook")
-                            }
+                        OutlinedButton(
+                            onClick = { showCreateFolderDialog = true },
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Folder")
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // Search & Type Filter Bar
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            placeholder = { Text("Search by title or #tag…") },
-                            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                            trailingIcon = {
-                                if (searchQuery.isNotEmpty()) {
-                                    IconButton(onClick = { searchQuery = "" }) {
-                                        Icon(Icons.Default.Clear, contentDescription = "Clear")
-                                    }
+                    // Search Field + Scrollable Type Filter Chips
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = { Text("Search by title or #tag…") },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { searchQuery = "" }) {
+                                    Icon(Icons.Default.Clear, contentDescription = "Clear")
                                 }
-                            },
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(52.dp)
-                        )
+                            }
+                        },
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
 
-                        // Filter Chips
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(
-                                selected = selectedFilter == LibraryFilter.ALL,
-                                onClick = { selectedFilter = LibraryFilter.ALL },
-                                label = { Text("All") }
-                            )
-                            FilterChip(
-                                selected = selectedFilter == LibraryFilter.NOTEBOOKS,
-                                onClick = { selectedFilter = LibraryFilter.NOTEBOOKS },
-                                label = { Text("Notebooks") }
-                            )
-                            FilterChip(
-                                selected = selectedFilter == LibraryFilter.PDFS,
-                                onClick = { selectedFilter = LibraryFilter.PDFS },
-                                label = { Text("PDFs") }
-                            )
-                        }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = selectedFilter == LibraryFilter.ALL,
+                            onClick = { selectedFilter = LibraryFilter.ALL },
+                            label = { Text("All") }
+                        )
+                        FilterChip(
+                            selected = selectedFilter == LibraryFilter.NOTEBOOKS,
+                            onClick = { selectedFilter = LibraryFilter.NOTEBOOKS },
+                            label = { Text("Notebooks") }
+                        )
+                        FilterChip(
+                            selected = selectedFilter == LibraryFilter.PDFS,
+                            onClick = { selectedFilter = LibraryFilter.PDFS },
+                            label = { Text("PDFs") }
+                        )
                     }
 
                     // Folder Filter Bar (if user created folders)
@@ -468,7 +503,7 @@ fun LibraryScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
-                    .padding(horizontal = 24.dp)
+                    .padding(horizontal = 16.dp)
             ) {
                 if (filteredDocs.isEmpty()) {
                     Box(
@@ -510,12 +545,47 @@ fun LibraryScreen(
                         }
                     }
                 } else {
-                    LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 240.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        if (selectedFilter == LibraryFilter.PDFS) {
+                            OutlinedCard(
+                                onClick = { launchPdfPicker() },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp),
+                                colors = CardDefaults.outlinedCardColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Icon(Icons.Default.FileOpen, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                        Column {
+                                            Text("Select Another PDF from Device / Files", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                            Text("Browse storage, Downloads, or Drive to import more PDFs", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                    Icon(Icons.Default.AddCircle, contentDescription = "Add PDF", tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
+
+                        LazyVerticalGrid(
+                            columns = GridCells.Adaptive(minSize = 240.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            contentPadding = PaddingValues(bottom = 84.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
                         items(filteredDocs, key = { it.id }) { doc ->
                             val folderName = remember(doc.folderId, folders) {
                                 folders.find { it.id == doc.folderId }?.name
@@ -565,6 +635,7 @@ fun LibraryScreen(
                             )
                         }
                     }
+                    }
                 }
             }
         }
@@ -572,7 +643,7 @@ fun LibraryScreen(
 
     // PDF Importing Progress Indicator
     if (isImportingPdf) {
-        androidx.compose.ui.window.Dialog(onDismissRequest = {}) {
+        androidx.compose.ui.window.Dialog(onDismissRequest = { isImportingPdf = false }) {
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = MaterialTheme.colorScheme.surface,
@@ -584,9 +655,12 @@ fun LibraryScreen(
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     CircularProgressIndicator(modifier = Modifier.size(36.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text("Importing PDF…", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                         Text("Reading pages and preparing workspace", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    TextButton(onClick = { isImportingPdf = false }) {
+                        Text("Cancel")
                     }
                 }
             }

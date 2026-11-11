@@ -324,10 +324,14 @@ class DocumentRepository(
             pageDao.insertOrUpdate(page.copy(pageIndex = page.pageIndex + 1))
         }
 
+        val refPage = allPages.getOrNull(afterIndex.coerceIn(0, (allPages.size - 1).coerceAtLeast(0)))
+            ?: allPages.firstOrNull()
         val newPage = Page(
             id = UUID.randomUUID().toString(),
             documentId = documentId,
             index = targetInsertIndex,
+            width = refPage?.width ?: 595f,
+            height = refPage?.height ?: 842f,
             template = template
         )
         pageDao.insertOrUpdate(PageEntity.fromDomain(newPage))

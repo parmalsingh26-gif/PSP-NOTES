@@ -5,6 +5,7 @@ enum class ToolType {
     BALLPOINT,
     PENCIL,
     HIGHLIGHTER,
+    LASER,
     ERASER_STROKE,
     ERASER_PIXEL,
     LASSO,

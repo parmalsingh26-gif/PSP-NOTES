@@ -1,6 +1,10 @@
 package app.inkflow.studio
 
 import app.inkflow.studio.domain.model.PageImageObject
+import app.inkflow.studio.domain.model.ToolType
+import app.inkflow.studio.feature.editor.applyImageCrop
+import app.inkflow.studio.feature.editor.computeUncroppedFrame
+import app.inkflow.studio.feature.editor.isPointInsideImage
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import org.junit.Assert.*
@@ -150,6 +154,64 @@ class PageImageTest {
         assertEquals("i1", p1Images[0].id)
         assertEquals(1, p2Images.size)
         assertEquals("i2", p2Images[0].id)
+    }
+
+    @Test
+    fun testNonDistortingInteractiveCropAndReEditFrame() {
+        val original = PageImageObject(
+            id = "img-crop-real",
+            pageId = "p1",
+            filePath = "/sample.png",
+            x = 100f,
+            y = 100f,
+            width = 200f,
+            height = 100f
+        )
+
+        val cropped = applyImageCrop(
+            img = original,
+            liveLeft = 0.25f,
+            liveTop = 0.10f,
+            liveRight = 0.75f,
+            liveBottom = 0.90f
+        )
+
+        // Displayed box shrinks proportionally to cropped fractions (no stretching)
+        assertEquals(150f, cropped.x, 0.05f)
+        assertEquals(110f, cropped.y, 0.05f)
+        assertEquals(100f, cropped.width, 0.05f)
+        assertEquals(80f, cropped.height, 0.05f)
+        assertEquals(0.25f, cropped.cropLeft, 0.001f)
+        assertEquals(0.75f, cropped.cropRight, 0.001f)
+
+        // Re-entering crop mode reconstructs exact original uncropped outer bounds
+        val reconstructed = computeUncroppedFrame(cropped)
+        assertEquals(100f, reconstructed.fullX, 0.05f)
+        assertEquals(100f, reconstructed.fullY, 0.05f)
+        assertEquals(200f, reconstructed.fullW, 0.05f)
+        assertEquals(100f, reconstructed.fullH, 0.05f)
+    }
+
+    @Test
+    fun testRotatedImageHitDetectionAndLaserToolAvailability() {
+        // Wide box 200x60 rotated 90 degrees becomes tall 60x200 around center (200, 130)
+        val rotated = PageImageObject(
+            id = "img-rot",
+            pageId = "p1",
+            filePath = "/rot.png",
+            x = 100f,
+            y = 100f,
+            width = 200f,
+            height = 60f,
+            rotationDegrees = 90f
+        )
+
+        // Center (200, 130): tip at (200, 210) is inside rotated height, outside unrotated 100..160
+        assertTrue(isPointInsideImage(200f, 210f, rotated, pad = 2f))
+        // Far wing (280, 130) was inside unrotated width, now outside rotated bounds
+        assertFalse(isPointInsideImage(280f, 130f, rotated, pad = 2f))
+
+        assertTrue(ToolType.entries.contains(ToolType.LASER))
     }
 }
 
